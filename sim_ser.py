@@ -14,11 +14,13 @@ from swf_utils.swf_categorizer import (
     parse_sdsc_sp2_log,
     detect_and_remove_anomalies,
     compute_bin_edges,
-    classify_job
+    classify_job,
+    split_by_weekday
 )
 from vae_training import (
     VAE, set_seed, HIDDEN_DIMS
 )
+from train_all_vae import (train_all_vaes)
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.abspath(os.path.dirname(__file__))
@@ -41,6 +43,7 @@ job_status = {}  # job_id -> {'status': ..., 'result': ...}
 # ─── 1) PARSE SWF & COMPUTE BIN EDGES ───────────────────────────────────────
 print("[INIT] Parsing SWF and computing bin edges...")
 df_all = parse_sdsc_sp2_log(SWF_PATH)
+split_by_weekday(df_all)
 _, df_clean = detect_and_remove_anomalies(df_all, ANOMALY_PCT / 100.0)
 RT_EDGES, CPU_EDGES = compute_bin_edges(df_clean)
 print(f"[INIT] Runtime edges: {RT_EDGES}")
@@ -48,7 +51,7 @@ print(f"[INIT] CPU-util edges: {CPU_EDGES}")
 
 # ─── 2) PROMPT TO RETRAIN VAEs ──────────────────────────────────────────────
 def export_and_train_all():
-    raise NotImplementedError("Use your existing export_and_train_all here")
+    train_all_vaes()
 
 def prompt_and_train():
     resp = input("Retrain VAEs now? (y/n): ").strip().lower()
