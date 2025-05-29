@@ -8,7 +8,8 @@ from torch.utils.tensorboard import SummaryWriter
 from swf_utils.swf_categorizer import (
     parse_sdsc_sp2_log,
     detect_and_remove_anomalies,
-    label_categories
+    label_categories,
+    split_by_weekday,
 )
 from vae_training import (
     VAE,
@@ -51,8 +52,15 @@ def export_subsets_to_excel():
         subdf.to_excel(os.path.join(SUBSETS_DIR, fname), index=False)
         print(f"Exported subset: {fname} ({len(subdf)} rows)")
 
+    weekday_buckets = split_by_weekday(labeled)
+    for wd, subdf in weekday_buckets.items():
+        fname = f"weekday_{wd}.xlsx"
+        subdf.to_excel(os.path.join(SUBSETS_DIR, fname), index=False)
+        print(f"Exported subset: {fname} ({len(subdf)} rows)")    
+
 
 def train_all_vaes():
+    set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 

@@ -43,7 +43,6 @@ job_status = {}  # job_id -> {'status': ..., 'result': ...}
 # ─── 1) PARSE SWF & COMPUTE BIN EDGES ───────────────────────────────────────
 print("[INIT] Parsing SWF and computing bin edges...")
 df_all = parse_sdsc_sp2_log(SWF_PATH)
-split_by_weekday(df_all)
 _, df_clean = detect_and_remove_anomalies(df_all, ANOMALY_PCT / 100.0)
 RT_EDGES, CPU_EDGES = compute_bin_edges(df_clean)
 print(f"[INIT] Runtime edges: {RT_EDGES}")
@@ -193,7 +192,7 @@ def generate_cloudlets(start_ts, end_ts, gran):
     weekday  = start_dt.weekday()
     print(f"[GEN] Generating cloudlets for weekday {weekday} from {start_dt.time()} to {end_dt.time()}")
 
-    path = os.path.join(SUBSETS_DIR, f"weekday_{weekday}_data.xlsx")
+    path = os.path.join(SUBSETS_DIR, f"weekday_{weekday}.xlsx")
     if not os.path.exists(path):
         raise FileNotFoundError(f"No data for weekday {weekday}")
 

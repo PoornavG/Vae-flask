@@ -48,7 +48,11 @@ def compare_synthetic(n_samples=500, runs=10, noise_scale=0.01, hidden_dims=[128
     import sklearn.preprocessing._data as _sd
     torch.serialization.add_safe_globals([_sd.StandardScaler])
 
-    for ckpt_path in glob.glob(os.path.join("vae_models", "*_vae.pt")):
+    # ensure output directory exists
+    out_dir = "vae_models"
+    os.makedirs(out_dir, exist_ok=True)
+
+    for ckpt_path in glob.glob(os.path.join(out_dir, "*_vae.pt")):
         subset = os.path.basename(ckpt_path).replace("_vae.pt", "")
         print(f"\n▶ Processing subset: {subset}")
 
@@ -68,6 +72,7 @@ def compare_synthetic(n_samples=500, runs=10, noise_scale=0.01, hidden_dims=[128
 
         mean_vectors = []  # store column means for each run
 
+        # generate and save synthetic datasets
         for run in range(1, runs+1):
             print(f"  • Run {run}/{runs}…", end=" ")
 
@@ -82,45 +87,97 @@ def compare_synthetic(n_samples=500, runs=10, noise_scale=0.01, hidden_dims=[128
             gen_data = scaler.inverse_transform(out)
             df_gen   = pd.DataFrame(gen_data, columns=features)
 
-            # save
-            out_file = os.path.join("vae_models",
-                                    f"{subset}_synthetic_{run}.xlsx")
-            with pd.ExcelWriter(out_file, engine='xlsxwriter') as writer:
+            # save Excel
+            excel_path = os.path.join(out_dir, f"{subset}_synthetic_{run}.xlsx")
+            with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
                 df_gen.to_excel(writer, sheet_name='Data', index=False)
-            print("saved.", flush=True)
+            print("saved.")
 
             # record means
             mean_vectors.append(df_gen.mean().values)
 
-        # build mean‐matrix & distance matrix
-        mean_mat = np.vstack(mean_vectors)              # shape (runs, n_features)
-        dist_mat = squareform(pdist(mean_mat, metric='euclidean'))
+        # compute pairwise distance matrix
+        mean_mat = np.vstack(mean_vectors)           # shape (runs, n_features)
+        dists    = pdist(mean_mat, metric='euclidean')
+        dist_mat = squareform(dists)
 
-        # plot heatmap of pairwise distances
+        # --- Numeric summaries --- #
+        # Pairwise-distance stats
+        dist_stats = {
+            'mean':   np.mean(dists),
+            'median': np.median(dists),
+            'min':    np.min(dists),
+            'max':    np.max(dists),
+            'std':    np.std(dists, ddof=1)
+        }
+        df_dist = pd.DataFrame.from_dict(dist_stats, orient='index', columns=['value'])
+        df_dist.to_csv(os.path.join(out_dir, f"{subset}_distance_summary.csv"))
+
+        # Per-feature stats
+        feat_means = mean_mat.mean(axis=0)
+        feat_stds  = mean_mat.std(axis=0, ddof=1)
+        feat_ranges= mean_mat.max(axis=0) - mean_mat.min(axis=0)
+        df_feat = pd.DataFrame({
+            'feature': features,
+            'mean_of_means': feat_means,
+            'std_of_means':  feat_stds,
+            'range_of_means':feat_ranges
+        })
+        df_feat.to_csv(os.path.join(out_dir, f"{subset}_feature_summary.csv"), index=False)
+
+        # --- Plots --- #
+        # 1. Heatmap (existing)
         fig, ax = plt.subplots()
-        im = ax.imshow(dist_mat, aspect='auto')
-        ax.set_title(f"Euclidean distance between mean vectors ({subset})")
-        ax.set_xlabel("run index")
-        ax.set_ylabel("run index")
-        fig.colorbar(im, ax=ax)
-        plt.savefig(os.path.join("vae_models", f"{subset}_heatmap.png"))
+        im = ax.imshow(dist_mat, aspect='auto', cmap='viridis')
+        ax.set_title(f"Euclidean distances ({subset})")
+        ax.set_xlabel("run")
+        ax.set_ylabel("run")
+        fig.colorbar(im, ax=ax, label='distance')
+        fig_path = os.path.join(out_dir, f"{subset}_heatmap.png")
+        fig.savefig(fig_path, bbox_inches='tight')
         plt.close(fig)
 
-        # plot feature‐means across runs
+        # 2. Bar chart of distance stats
         fig, ax = plt.subplots()
-        for feat_idx, feat in enumerate(features):
-            ax.plot(range(1, runs+1),
-                    mean_mat[:, feat_idx],
-                    label=feat)
-        ax.set_title(f"Feature means across runs ({subset})")
+        df_dist.plot.bar(ax=ax, legend=False)
+        ax.set_title(f"Distance summary ({subset})")
+        ax.set_ylabel("value")
+        ax.set_xticklabels(df_dist.index, rotation=45)
+        fig_path = os.path.join(out_dir, f"{subset}_distance_bar.png")
+        fig.savefig(fig_path, bbox_inches='tight')
+        plt.close(fig)
+
+        # 3. Error-bar plot for per-feature means
+        fig, ax = plt.subplots()
+        ax.errorbar(
+            x=np.arange(len(features)),
+            y=feat_means,
+            yerr=feat_stds,
+            fmt='o',
+            capsize=5
+        )
+        ax.set_xticks(np.arange(len(features)))
+        ax.set_xticklabels(features, rotation=45, ha='right')
+        ax.set_title(f"Feature means ±1 std ({subset})")
+        ax.set_ylabel("value")
+        fig_path = os.path.join(out_dir, f"{subset}_feature_errorbar.png")
+        fig.savefig(fig_path, bbox_inches='tight')
+        plt.close(fig)
+
+        # 4. Line plot of feature means across runs (existing)
+        fig, ax = plt.subplots()
+        for idx, feat in enumerate(features):
+            ax.plot(range(1, runs+1), mean_mat[:, idx], label=feat)
+        ax.set_title(f"Feature means over runs ({subset})")
         ax.set_xlabel("run")
-        ax.set_ylabel("feature mean")
+        ax.set_ylabel("mean value")
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
         fig.tight_layout()
-        plt.savefig(os.path.join("vae_models", f"{subset}_feature_means.png"))
+        fig_path = os.path.join(out_dir, f"{subset}_feature_means.png")
+        fig.savefig(fig_path, bbox_inches='tight')
         plt.close(fig)
 
-        print(f"  ✓ Comparison plots saved for subset `{subset}`.")
+        print(f"  ✓ Summaries & plots saved for subset `{subset}`.")
 
 if __name__ == "__main__":
     compare_synthetic()

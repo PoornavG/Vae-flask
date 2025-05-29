@@ -179,7 +179,7 @@ def generate_cloudlets(start_ts, end_ts, gran):
     weekday  = start_dt.weekday()
     print(f"[GEN] Generating cloudlets for weekday {weekday} from {start_dt.time()} to {end_dt.time()}")
 
-    path = os.path.join(SUBSETS_DIR, f"weekday_{weekday}_data.xlsx")
+    path = os.path.join(SUBSETS_DIR, f"weekday_{weekday}.xlsx")
     if not os.path.exists(path):
         raise FileNotFoundError(f"No data for weekday {weekday}")
 
