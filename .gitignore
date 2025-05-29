@@ -1,0 +1,14 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+
+# Ignore all folders except swf_utils
+/*/
+!/swf_utils/
+
+# Optional: if swf_utils contains nested folders you want to include
+!/swf_utils/**
