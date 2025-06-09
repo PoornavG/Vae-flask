@@ -13,6 +13,7 @@ from collections import Counter
 from swf_utils.swf_categorizer import (
     parse_sdsc_sp2_log,
     detect_and_remove_anomalies,
+    compute_job_count_edges,
     compute_bin_edges,
     classify_job,
     split_by_weekday
@@ -20,15 +21,15 @@ from swf_utils.swf_categorizer import (
 from vae_training import (
     VAE, set_seed, HIDDEN_DIMS
 )
-from train_all_vae import (train_all_vaes)
+from train_all_vae import train_all_vaes
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.abspath(os.path.dirname(__file__))
 SWF_PATH    = "/home/poornav/cloudsim-simulator/SDSC-SP2-1998-4.2-cln.swf"
-ANOMALY_PCT = 1.0
+ANOMALY_PCT = 1.0             # percent contamination
 SUBSETS_DIR = os.path.join(BASE_DIR, "subsets")
 WEIGHTS_DIR = os.path.join(BASE_DIR, "vae_models")
-DEFAULT_GRAN = 600  # 10 minutes in seconds
+DEFAULT_GRAN = 600            # 10 minutes in seconds
 
 os.makedirs(SUBSETS_DIR, exist_ok=True)
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
@@ -42,11 +43,18 @@ job_status = {}  # job_id -> {'status': ..., 'result': ...}
 
 # ─── 1) PARSE SWF & COMPUTE BIN EDGES ───────────────────────────────────────
 print("[INIT] Parsing SWF and computing bin edges...")
-df_all = parse_sdsc_sp2_log(SWF_PATH)
+df_all    = parse_sdsc_sp2_log(SWF_PATH)
+split_by_weekday(df_all)  # pre-generate per-weekday subsets if your pipeline uses it
 _, df_clean = detect_and_remove_anomalies(df_all, ANOMALY_PCT / 100.0)
+
+# compute VAEs’ runtime/cpu edges
 RT_EDGES, CPU_EDGES = compute_bin_edges(df_clean)
 print(f"[INIT] Runtime edges: {RT_EDGES}")
 print(f"[INIT] CPU-util edges: {CPU_EDGES}")
+
+# compute user‐activity (job-count) edges
+JOB_COUNT_EDGES = compute_job_count_edges(df_clean)
+print(f"[INIT] Job-count edges: {JOB_COUNT_EDGES}")
 
 # ─── 2) PROMPT TO RETRAIN VAEs ──────────────────────────────────────────────
 def export_and_train_all():
@@ -64,14 +72,9 @@ def prompt_and_train():
 prompt_and_train()
 
 # ─── 3) JOB SAMPLING ────────────────────────────────────────────────────────
-def sample_valid_jobs(model, scaler, latent_d, need, max_attempts=3):
-    """
-    Sample `need` jobs from the VAE decoder, extracting interarrival directly
-    from the decoded output instead of using a fixed mean.
-    """
+def sample_valid_jobs(model, scaler, latent_d, need, interarrival, max_attempts=3):
     jobs = []
     attempts = need * max_attempts
-
     while len(jobs) < need and attempts > 0:
         batch_size = min(need - len(jobs), 64)
         z = torch.randn(batch_size, latent_d)
@@ -81,25 +84,19 @@ def sample_valid_jobs(model, scaler, latent_d, need, max_attempts=3):
         real_vals = scaler.inverse_transform(outp)
 
         for vals in real_vals:
-            # Extract interarrival directly
-            interarrival = max(float(vals[0]), 0.0)
-            length       = max(float(vals[1]), 0.0)
-            pes          = max(int(round(vals[2])), 1)
-            cpu_time     = max(float(vals[3]), 0.0)
-            ram          = max(float(vals[4]), 0.0)
-
-            # Skip degenerate samples
-            if length == 0.0 and cpu_time == 0.0 and interarrival == 0.0:
+            length   = max(float(vals[1]), 0.0)
+            cpu_time = max(float(vals[3]), 0.0)
+            if length == 0.0 and cpu_time == 0.0:
                 continue
-
+            pes = max(int(round(vals[2])), 1)
+            ram = max(float(vals[4]), 0.0)
             jobs.append({
                 "length":       length if length > 0.0 else cpu_time,
                 "pes":          pes,
                 "cpu_time":     cpu_time if cpu_time > 0.0 else length,
                 "ram":          ram,
-                "interarrival": interarrival
+                "interarrival": max(interarrival, 0.0)
             })
-
             if len(jobs) == need:
                 break
 
@@ -112,7 +109,7 @@ def sample_valid_jobs(model, scaler, latent_d, need, max_attempts=3):
             "pes":          1,
             "cpu_time":     0.0,
             "ram":          0.0,
-            "interarrival": 0.0
+            "interarrival": max(interarrival, 0.0)
         })
 
     return jobs
@@ -148,6 +145,7 @@ def submit():
             raise ValueError
     except ValueError:
         abort(400, "'day' must be an integer 0–6")
+
     try:
         sh, sm = map(int, data["start_time"].split(":"))
         eh, em = map(int, data["end_time"].split(":"))
@@ -202,30 +200,53 @@ def generate_cloudlets(start_ts, end_ts, gran):
 
     intervals = pd.interval_range(start=start_dt, end=end_dt, freq="10min", closed="left")
     output = []
+
     for iv in intervals:
+        print(f"[GEN] Interval {iv.left} - {iv.right}")
         left_t, right_t = iv.left.time(), iv.right.time()
         bucket = df[(df["TimeOfDay"] >= left_t) & (df["TimeOfDay"] < right_t)]
         real_count = len(bucket)
-        to_gen    = real_count 
+        print(f"[GEN]   Found {real_count} real jobs")
+
+        # — per-user counts & activity binning —
+        user_counts = (
+            bucket['UserID']
+            .value_counts()
+            .rename('job_count')
+            .reset_index()
+            .rename(columns={'index': 'UserID'})
+        )
+        user_counts['ActivityBin'] = pd.cut(
+            user_counts['job_count'],
+            bins=JOB_COUNT_EDGES,
+            labels=['Low','Mid','High'],
+            include_lowest=True
+        )
+        activity_summary = user_counts['ActivityBin'].value_counts().to_dict()
+
+        to_gen = real_count
+        print(f"[GEN]   Will generate {to_gen} synthetic jobs to match real count")
 
         source_df = bucket if real_count > 0 else df
         cats      = [classify_job(r, RT_EDGES, CPU_EDGES) for _, r in source_df.iterrows()]
         counts    = Counter(cats)
         total     = sum(counts.values())
         mix       = {c: counts[c] / total for c in counts}
+        print(f"[GEN]   Category mix: {mix}")
 
         alloc = {c: int(round(mix[c] * to_gen)) for c in mix}
         jobs  = []
+
         for cat, n_cat in alloc.items():
+            print(f"[GEN]     Category {cat}: allocate {n_cat}")
             if n_cat < 1:
                 continue
             ckpt_file = f"{cat.lower()}_data_vae.pt"
             ckpt_path = os.path.join(WEIGHTS_DIR, ckpt_file)
             if not os.path.exists(ckpt_path):
-                print(f"[GEN]     Missing checkpoint for {cat}")
+                print(f"[GEN]     Missing checkpoint for {cat} at {ckpt_file}")
                 continue
 
-            # load full checkpoint (model + scaler)
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             feats, scaler, state = ckpt["features"], ckpt["scaler"], ckpt["model_state"]
             latent_d = state["fc_mu.weight"].shape[0]
@@ -234,15 +255,18 @@ def generate_cloudlets(start_ts, end_ts, gran):
             model.load_state_dict(state)
             model.eval()
 
-            valid_jobs = sample_valid_jobs(model, scaler, latent_d, n_cat)
+            ia = float(bucket["Interarrival"].mean()) if real_count > 0 else 1.0
+            valid_jobs = sample_valid_jobs(model, scaler, latent_d, n_cat, ia)
             jobs.extend(valid_jobs)
-            print(f"[GEN]     Category {cat}: generated {len(valid_jobs)}/{n_cat} jobs")
+            print(f"[GEN]   Generated {len(valid_jobs)}/{n_cat} valid jobs for category {cat}")
 
         output.append({
-            "interval_start": int(iv.left.timestamp()),
-            "interval_end":   int(iv.right.timestamp()),
-            "category_mix":   mix,
-            "jobs":           jobs
+            "interval_start":   int(iv.left.timestamp()),
+            "interval_end":     int(iv.right.timestamp()),
+            "category_mix":     mix,
+            "jobs":             jobs,
+            "user_activity":    user_counts.to_dict(orient='records'),
+            "activity_summary": activity_summary
         })
 
     return output

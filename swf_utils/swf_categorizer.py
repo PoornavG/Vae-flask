@@ -137,6 +137,26 @@ def compute_bin_edges(df):
     rt_edges = normalize_breaks(raw_rt)
     return rt_edges, cpu_edges
 
+def compute_job_count_edges(df):
+    """
+    Compute edges for user job-count (head-tail) bins based on a DataFrame slice.
+    Returns a list of 4 floats defining the Low/Mid/High activity thresholds:
+      [min_count, edge1, edge2, max_count].
+    """
+    # Count jobs per user
+    user_job_counts = df['UserID'].value_counts().values
+
+    # If there are no users or only one unique count, use default linear bins
+    if len(user_job_counts) == 0:
+        return [0, 1, 2, 3]
+    
+    # Use head-tail breaks to find raw thresholds
+    raw_breaks = head_tail_breaks(pd.Series(user_job_counts))
+    
+    # Normalize to exactly 4 edges
+    job_count_edges = normalize_breaks(raw_breaks)
+    
+    return job_count_edges
 
 def classify_job(job, rt_edges, cpu_edges):
     """Classify single job record into category using precomputed edges."""

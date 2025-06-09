@@ -2,34 +2,49 @@ import sys
 import os
 import pandas as pd
 
-# Make sure we can import our categorizer module
+# Ensure your swf_utils directory (with both swf_categorizer.py and compute_job_count_edges) is on the path
 script_dir = os.path.abspath(os.path.join(os.getcwd(), 'swf_utils'))
 sys.path.insert(0, script_dir)
 
-from swf_categorizer import process_swf
+from swf_categorizer import parse_sdsc_sp2_log, compute_job_count_edges,detect_and_remove_anomalies
 
-# Adjust the SWF path as needed
-swf_path = '/home/poornav/cloudsim-simulator/SDSC-SP2-1998-4.2-cln.swf'
-anomalies_df, labeled_df, summary_df = process_swf(swf_path, anomaly_pct=1.0)
-
-# Prepare Excel writer
+# ───────── CONFIG ─────────
+swf_path    = '/home/poornav/cloudsim-simulator/SDSC-SP2-1998-4.2-cln.swf'
 output_path = '/home/poornav/cloudsim-simulator/swf_categories_with_stats.xlsx'
-with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-    # 1) Anomalies sheets
-    anomalies_df.to_excel(writer, sheet_name='Anomalies', index=False)  
-    anomalies_df.describe().transpose().to_excel(writer, sheet_name='Anomalies Stats')
-    
-    # 2) Per-category sheets
-    for cat in labeled_df['Category'].unique():
-        # Limit sheet name to 31 characters
-        sheet_name = cat[:31]
-        stats_name = f'{sheet_name} Stats'[:31]
-        
-        subset = labeled_df[labeled_df['Category'] == cat]
-        subset.to_excel(writer, sheet_name=sheet_name, index=False)
-        subset.describe().transpose().to_excel(writer, sheet_name=stats_name)
-    
-    # 3) Summary sheet
-    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+# ──────────────────────────
 
-print(f"Generated Excel workbook: {output_path}")
+# 1) Parse, detect anomalies, label jobs & summarize
+df = parse_sdsc_sp2_log(swf_path)
+anoms, clean = detect_and_remove_anomalies(df, 0.01)
+# 2) Compute job‐count edges for Low/Mid/High activity
+job_count_edges = compute_job_count_edges(clean)
+
+print("Activity bin edges:", job_count_edges)
+
+# 3) Aggregate per‐user job counts
+user_counts_df = (
+    df['UserID']
+    .value_counts()
+    .rename('job_count')
+    .reset_index()
+    .rename(columns={'index': 'UserID'})
+)
+
+# 4) Bin users into ActivityBin using the edges
+user_counts_df['ActivityBin'] = pd.cut(
+    user_counts_df['job_count'],
+    bins=job_count_edges,
+    labels=['Low', 'Mid', 'High'],
+    include_lowest=True
+)
+
+# 5) Build a summary of how many users are in each bin
+activity_counts = (
+    user_counts_df['ActivityBin']
+    .value_counts()
+    .rename_axis('ActivityBin')
+    .reset_index(name='UserCount')
+)
+print("User distribution across activity bins:")
+print(activity_counts)
+
