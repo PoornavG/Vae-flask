@@ -88,6 +88,18 @@ df_clean['SubmitTimeOfDay'] = df_clean['SubmitDateTime'].dt.strftime('%H:%M:%S')
 BURST_ACTIVITY_EDGES = compute_burst_activity_edges(df_clean, BURST_THRESHOLD_SECONDS)
 logging.info(f"[INIT] Global Burst Activity edges: {BURST_ACTIVITY_EDGES}")
 
+# Calculate burstiness metrics for 10-minute and 1-hour intervals
+logging.info("[INIT] Calculating burstiness metrics for intervals...")
+df_10min_metrics = calculate_interval_burstiness(df_clean, 10,BURST_THRESHOLD_SECONDS)
+df_1hour_metrics = calculate_interval_burstiness(df_clean, 60,BURST_THRESHOLD_SECONDS)
+
+# Determine burstiness thresholds for intervals
+thresholds_10min = determine_burstiness_thresholds(df_10min_metrics)
+thresholds_1hour = determine_burstiness_thresholds(df_1hour_metrics)
+
+logging.info(f"[INIT] 10-minute burstiness thresholds: {thresholds_10min}")
+logging.info(f"[INIT] 1-hour burstiness thresholds: {thresholds_1hour}")
+
 # ─── 2) USER PROFILE ANALYSIS ──────────────────────────────────────────────
 def analyze_user_profiles():
     """Analyze user behavior patterns and burstiness levels."""
@@ -290,9 +302,59 @@ def calculate_user_jobs_in_interval(user_id, start_dt, end_dt, weekday):
         ]
         base_count = max(1, len(hour_activity) // 30)  # Rough estimate
     
+    # Calculate burstiness for this interval
+    interval_10min_data = df_clean[
+        (df_clean['UserID'] == user_id) &
+        (df_clean['SubmitDateTime'] >= start_dt) &
+        (df_clean['SubmitDateTime'] < end_dt)
+    ]
+    
+    interval_1hour_start = start_dt.replace(minute=0, second=0)
+    interval_1hour_end = interval_1hour_start + pd.Timedelta(hours=1)
+    interval_1hour_data = df_clean[
+        (df_clean['UserID'] == user_id) &
+        (df_clean['SubmitDateTime'] >= interval_1hour_start) &
+        (df_clean['SubmitDateTime'] < interval_1hour_end)
+    ]
+    
+    # Classify burstiness level
+    if len(interval_10min_data) >= 5:
+        # Calculate burstiness metrics for 10-minute interval
+        job_count = len(interval_10min_data)
+        interval_duration = (end_dt - start_dt).total_seconds() / 60  # in minutes
+        arrival_rate = job_count / interval_duration if interval_duration > 0 else 0
+        
+        # Classify based on 10-minute thresholds
+        if (job_count >= thresholds_10min['job_count']['medium'] and
+            arrival_rate >= thresholds_10min['arrival_rate']['medium']):
+            burst_level = 'High'
+        elif (job_count >= thresholds_10min['job_count']['low'] and
+              arrival_rate >= thresholds_10min['arrival_rate']['low']):
+            burst_level = 'Mid'
+        else:
+            burst_level = 'Low'
+    elif len(interval_1hour_data) >= 5:
+        # Calculate burstiness metrics for 1-hour interval
+        job_count = len(interval_1hour_data)
+        interval_duration = 60  # 1 hour in minutes
+        arrival_rate = job_count / interval_duration
+        
+        # Classify based on 1-hour thresholds
+        if (job_count >= thresholds_1hour['job_count']['medium'] and
+            arrival_rate >= thresholds_1hour['arrival_rate']['medium']):
+            burst_level = 'High'
+        elif (job_count >= thresholds_1hour['job_count']['low'] and
+              arrival_rate >= thresholds_1hour['arrival_rate']['low']):
+            burst_level = 'Mid'
+        else:
+            burst_level = 'Low'
+    else:
+        # Fall back to precomputed user-level burstiness
+        burst_level = profile['burst_level']
+    
     # Adjust based on burstiness level
     burst_multiplier = {'Low': 0.8, 'Mid': 1.0, 'High': 1.5}
-    adjusted_count = int(base_count * burst_multiplier[profile['burst_level']])
+    adjusted_count = int(base_count * burst_multiplier[burst_level])
     adjusted_count = max(1, adjusted_count)  # At least 1 job
     
     # Get user's preferred categories for this hour
@@ -305,7 +367,7 @@ def calculate_user_jobs_in_interval(user_id, start_dt, end_dt, weekday):
         # Fall back to user's overall primary categories
         preferred_categories = list(profile['primary_categories'].keys())
     
-    return adjusted_count, preferred_categories
+    return adjusted_count, preferred_categories, burst_level
 
 # ─── 7) WORKER THREAD ──────────────────────────────────────────────────────
 def worker():
@@ -401,10 +463,11 @@ def status(job_id):
     }))
 
 # ─── 9) ENHANCED CLOUDLET GENERATION WITH USER ANALYSIS ────────────────────
+# ─── 9) ENHANCED CLOUDLET GENERATION WITH USER ANALYSIS ────────────────────
 def generate_cloudlets_with_users(start_ts, end_ts, gran):
     """Generate cloudlets considering user behavior patterns and burstiness."""
-    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    start_dt = datetime.fromtimestamp(start_ts, tz=None)  # Remove timezone info
+    end_dt = datetime.fromtimestamp(end_ts, tz=None)      # Remove timezone info
     weekday = start_dt.weekday()
     logging.info(f"[GEN] Generating cloudlets for weekday {weekday} from {start_dt.time()} to {end_dt.time()}")
     
@@ -440,7 +503,7 @@ def generate_cloudlets_with_users(start_ts, end_ts, gran):
         
         # Generate jobs for each active user
         for user_id in active_users:
-            job_count, preferred_categories = calculate_user_jobs_in_interval(
+            job_count, preferred_categories, burst_level = calculate_user_jobs_in_interval(
                 user_id, iv.left, iv.right, weekday
             )
             
@@ -448,7 +511,6 @@ def generate_cloudlets_with_users(start_ts, end_ts, gran):
                 continue
                 
             user_profile = user_profiles.get(user_id, {})
-            burst_level = user_profile.get('burst_level', 'Low')
             
             user_activity[int(user_id)] = {
                 'job_count': job_count,

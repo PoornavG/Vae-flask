@@ -137,6 +137,34 @@ def compute_bin_edges(df):
     rt_edges = normalize_breaks(raw_rt)
     return rt_edges, cpu_edges
 
+def compute_user_burst_metrics(df, burst_threshold_seconds=60):
+    """For each user, find the size of their largest job burst."""
+    if df.empty:
+        return pd.Series(dtype=int)
+
+    df_sorted = df.sort_values(['UserID', 'SubmitDateTime'])
+    df_sorted['UserInterarrival'] = df_sorted.groupby('UserID')['SubmitDateTime'].diff().dt.total_seconds()
+    
+    is_new_burst = df_sorted['UserInterarrival'] > burst_threshold_seconds
+    burst_group_id = is_new_burst.cumsum()
+    
+    burst_sizes = df_sorted.groupby(['UserID', burst_group_id]).transform('size')
+    
+    max_bursts_per_user = burst_sizes.groupby(df_sorted['UserID']).max()
+    return max_bursts_per_user
+
+def compute_burst_activity_edges(df, burst_threshold_seconds=60):
+    """Compute edges for user activity bins based on job burst sizes."""
+    user_max_bursts = compute_user_burst_metrics(df, burst_threshold_seconds)
+
+    if user_max_bursts.empty:
+        return [0, 1, 2, 3]
+    
+    raw_breaks = head_tail_breaks(user_max_bursts)
+    burst_count_edges = normalize_breaks(raw_breaks)
+    
+    return burst_count_edges
+
 def compute_job_count_edges(df):
     """
     Compute edges for user job-count (head-tail) bins based on a DataFrame slice.
@@ -164,3 +192,6 @@ def classify_job(job, rt_edges, cpu_edges):
     rt_bin = pd.cut([job['RunTime']], bins=rt_edges, labels=['Low','Mid','High'], include_lowest=True)[0]
     ci_bin = pd.cut([cpu_util], bins=cpu_edges, labels=['Low','Mid','High'], include_lowest=True)[0]
     return f"{rt_bin}_{ci_bin}"
+
+
+
