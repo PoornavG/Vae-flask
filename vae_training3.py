@@ -7,7 +7,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Dataset
 from sklearn.preprocessing import StandardScaler
 from torch.utils.tensorboard import SummaryWriter
-
+from sklearn.preprocessing import PowerTransformer
+import torch.nn.functional as F
 # Assuming config.py is accessible in the Python path
 try:
     from config import (
@@ -165,16 +166,19 @@ class VAE(nn.Module):
         return x_reconstructed, mu, log_var
 
 # VAE Loss Function
-def vae_loss(x_reconstructed, x, mu, log_var, kl_weight=1.0):
-    # Reconstruction loss (MSE)
-    reconstruction_loss = nn.functional.mse_loss(x_reconstructed, x, reduction='sum')
+def vae_loss(reconstructed_x, x, mu, logvar, kl_weight):
+    # Reconstruction loss (e.g., MSE)
+    recon_loss = F.mse_loss(reconstructed_x, x, reduction='sum') # Using sum as in the diff
     
-    # KL divergence loss
-    # D_KL(N(mu, sigma^2) || N(0, 1)) = 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    kl_divergence = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    # KL divergence
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     
-    return reconstruction_loss + kl_weight * kl_divergence
+    # Total loss with beta-weighting
+    loss = recon_loss + kl_weight * kl_loss
+    return loss
 
+KL_ANNEAL_EPOCHS = 30 # This will be effectively replaced by warmup_epochs
+GRAD_CLIP_NORM = 1.0
 # Training function
 def train_vae(model, train_loader, val_loader, optimizer, scheduler, epochs, patience, writer):
     device = next(model.parameters()).device
@@ -183,7 +187,20 @@ def train_vae(model, train_loader, val_loader, optimizer, scheduler, epochs, pat
 
     print(f"Starting training on {device}...")
 
+    # hyperparameters from the diff
+    target_beta = 0.1      # how much weight to give KL relative to recon
+    warmup_epochs = 30     # linearly ramp beta from 0->target_beta over these epochs
+
     for epoch in range(epochs):
+        # linear warm-up schedule for beta (KL weight)
+        if epoch < warmup_epochs: # Use epoch < warmup_epochs as epoch starts from 0
+            beta = target_beta * ((epoch + 1) / warmup_epochs) # epoch + 1 to avoid 0 beta in first epoch
+        else:
+            beta = target_beta
+        
+        # Log the current beta value
+        writer.add_scalar('Hyperparameters/beta', beta, epoch)
+
         model.train()
         train_loss = 0
         for batch_idx, data in enumerate(train_loader):
@@ -192,10 +209,8 @@ def train_vae(model, train_loader, val_loader, optimizer, scheduler, epochs, pat
             
             reconstructed_data, mu, log_var = model(data)
             
-            # KL Annealing: Gradually increase KL weight over initial epochs
-            kl_weight = min(1.0, epoch / KL_ANNEAL_EPOCHS)
-            
-            loss = vae_loss(reconstructed_data, data, mu, log_var, kl_weight=kl_weight)
+            # Use the calculated beta as kl_weight
+            loss = vae_loss(reconstructed_data, data, mu, log_var, kl_weight=beta)
             loss.backward()
             
             # Gradient clipping
@@ -204,7 +219,7 @@ def train_vae(model, train_loader, val_loader, optimizer, scheduler, epochs, pat
             optimizer.step()
             train_loss += loss.item()
         
-        avg_train_loss = train_loss / len(train_loader.dataset)
+        avg_train_loss = train_loss / len(train_loader.dataset) # This assumes vae_loss is sum-reduced per batch
         writer.add_scalar('Loss/train', avg_train_loss, epoch)
 
         # Validation
@@ -214,22 +229,25 @@ def train_vae(model, train_loader, val_loader, optimizer, scheduler, epochs, pat
             for data in val_loader:
                 data = data.to(device)
                 reconstructed_data, mu, log_var = model(data)
-                loss = vae_loss(reconstructed_data, data, mu, log_var, kl_weight=1.0) # Use full KL weight for validation
+                # For validation, typically you'd use the full target_beta or 1.0 for KL weight
+                # The diff uses full weight for validation (implied by no beta calculation for validation)
+                # Let's stick to target_beta for consistency with the training phase's eventual beta.
+                loss = vae_loss(reconstructed_data, data, mu, log_var, kl_weight=target_beta) 
                 val_loss += loss.item()
         
-        avg_val_loss = val_loss / len(val_loader.dataset)
+        avg_val_loss = val_loss / len(val_loader.dataset) # This assumes vae_loss is sum-reduced per batch
         writer.add_scalar('Loss/val', avg_val_loss, epoch)
         
         scheduler.step(avg_val_loss)
 
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Beta: {beta:.4f}")
 
         # Early stopping
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             epochs_no_improve = 0
-            # Save the best model state
-            # No need to save here, as `train_all_vae2.py` saves the final state
+            # Save the best model state (optional, as the original comment says final state is saved)
+            # torch.save(model.state_dict(), 'best_vae_model.pth') 
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -297,10 +315,16 @@ def load_and_preprocess(path, features, sheet_name=0, drop_thresh=0.5, sequence_
         }
     
     # Apply log-transformation to highly-skewed features
-    skewed_features = ['RunTime', 'WaitTime', 'AverageCPUTimeUsed'] 
-    for feature in skewed_features:
-        if feature in df_clean.columns: # Check if the feature exists in the current df_clean
-            df_clean[feature] = np.log1p(df_clean[feature]) # log(x+1) to handle zeros
+    # === NEW: Power-transform highly-skewed features ===
+    skewed_features = ['RunTime', 'AverageCPUTimeUsed']
+    # Only keep those actually present
+    skewed_present = [f for f in skewed_features if f in df_clean.columns]
+    if skewed_present:
+        pt = PowerTransformer(method='yeo-johnson', standardize=False)
+        # reshape to 2d array, fit on raw values
+        df_clean[skewed_present] = pt.fit_transform(df_clean[skewed_present])
+    else:
+        pt = None
             
     # Standardize the data (mean=0, std=1)
     scaler = StandardScaler()
@@ -322,4 +346,4 @@ def load_and_preprocess(path, features, sheet_name=0, drop_thresh=0.5, sequence_
     
     print(f"  - Loaded {num_jobs} samples, formed {X_sequences_tensor.size(0)} sequences of length {sequence_length} with {len(features)} features (actual features used for training).")
     
-    return X_sequences_tensor, scaler, features, original_min_max # This 'features' list contains the names of features used for training
+    return X_sequences_tensor, scaler, pt, features, original_min_max # This 'features' list contains the names of features used for training

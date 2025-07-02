@@ -112,7 +112,7 @@ def train_all_vaes():
         
         try:
             # --- FIXED: load_and_preprocess needs the sheet_name argument ---
-            X, scaler, feats, original_min_max= load_and_preprocess(path, FEATURES, sheet_name=sheet_name)
+            X, scaler, pt, feats, original_min_max = load_and_preprocess(path, FEATURES, sheet_name=sheet_name)
         except Exception as e:
             print(f"Failed to preprocess sheet '{sheet_name}': {e}")
             continue
@@ -143,6 +143,7 @@ def train_all_vaes():
         ckpt = {
             'model_state': trained.state_dict(),
             'scaler': scaler,
+            'power_transformer': pt,
             'features': FEATURES, # This FEATURES will now be the complete list
             'latent_dim': latent,
             'original_min_max': original_min_max # Store original min/max for synthesis

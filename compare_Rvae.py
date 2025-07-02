@@ -9,6 +9,7 @@ from scipy import stats
 import numpy as np
 import json
 import torch.serialization # Import torch.serialization
+from sklearn.preprocessing import PowerTransformer
 
 # Import configurations
 try:
@@ -31,10 +32,10 @@ except ImportError:
     print("Error: vae_training3.py not found. Ensure it's in the correct path.")
     exit()
 
-# Add StandardScaler and numpy._core.multiarray._reconstruct to safe globals for torch.load
-# Note: For newer PyTorch versions (e.g., 2.6+), you might also need to explicitly add numpy.ndarray
-# or set weights_only=False in torch.load for checkpoints containing numpy objects.
+# Add StandardScaler, PowerTransformer and numpy._core.multiarray._reconstruct to safe globals for torch.load
+
 torch.serialization.add_safe_globals([StandardScaler, np._core.multiarray._reconstruct, np.ndarray])
+torch.serialization.add_safe_globals([PowerTransformer])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 set_seed(SEED) # Ensure reproducibility for data loading and model initialization
@@ -102,6 +103,7 @@ def load_all_rvaes_for_comparison():
             saved_latent_dim = checkpoint.get('latent_dim', DEFAULT_LATENT_DIM)
             saved_features = checkpoint.get('features', None)
             saved_scaler = checkpoint.get('scaler', StandardScaler())
+            saved_pt       = checkpoint.get('power_transformer', None)
             # FIXED: Load original_min_max
             saved_original_min_max = checkpoint.get('original_min_max', {})
             
@@ -121,6 +123,7 @@ def load_all_rvaes_for_comparison():
             models[category] = {
                 "model": model,
                 "scaler": saved_scaler,
+                "power_transformer": saved_pt,
                 "latent_dim": saved_latent_dim,
                 "features": saved_features,
                 "original_min_max": saved_original_min_max # Store original min/max
@@ -132,7 +135,7 @@ def load_all_rvaes_for_comparison():
     return models
 
 # --- Data Generation (Adapted for RVAE's sequence generation) ---
-def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_length, burst_level='Mid'):
+def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_length, burst_level='Mid', temperature=1.0):
     """
     Generates synthetic job sequence data for a given RVAE model.
     
@@ -142,6 +145,7 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
         num_sequences_to_generate (int): The number of synthetic sequences to generate.
         sequence_length (int): The length of each sequence to generate.
         burst_level (str): The burst level for MMPP inter-arrival time generation (default 'Mid').
+        temperature (float): The temperature for sampling latent space.
         
     Returns:
         pd.DataFrame: A DataFrame containing the generated synthetic data, flattened from sequences.
@@ -154,8 +158,9 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
     original_min_max = model_data['original_min_max'] # FIXED: Get original min/max
     
     # Features that were log-transformed during training
-    skewed_features = ['RunTime', 'AverageCPUTimeUsed']    
-
+    skewed_features = ['RunTime', 'AverageCPUTimeUsed']
+    pt = model_data.get('power_transformer', None)
+    
     generated_sequences = []
     
     # Generate interarrival times for individual jobs.
@@ -171,8 +176,8 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
         current_batch_size = min(batch_size, num_sequences_to_generate - len(generated_sequences))
         if current_batch_size <= 0:
             break
-
-        z = torch.randn(current_batch_size, latent_d).to(device) # Generate latent vectors on device
+        
+        z = torch.randn(current_batch_size, latent_d).to(device) * temperature # Generate latent vectors on device with temperature
         
         with torch.no_grad():
             model.eval()
@@ -186,6 +191,19 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
         # Reshape for scaler: (num_samples * sequence_length, num_features)
         reshaped_for_inverse = decoded_sequences_scaled.reshape(-1, len(features))
         real_vals_flat = scaler.inverse_transform(reshaped_for_inverse)
+        # === NEW: inverse PowerTransform for skewed cols ===
+        if pt is not None:
+            # find indices of skewed features in your feature list
+            skew_idx = [i for i, f in enumerate(features) if f in skewed_features]
+            if skew_idx:
+                # extract those columns
+                sub = real_vals_flat[:, skew_idx]
+                # build a DataFrame whose columns match the ones transformer saw
+                sub_df = pd.DataFrame(sub, columns=[features[i] for i in skew_idx])
+                # inverse_transform returns a NumPy array directly
+                inv_arr = pt.inverse_transform(sub_df)
+                # plug the inverted values back in
+                real_vals_flat[:, skew_idx] = inv_arr
         
         # Reshape back to sequences: (batch_size, sequence_length, num_features)
         real_vals_sequences = real_vals_flat.reshape(current_batch_size, sequence_length, len(features))
@@ -198,11 +216,8 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
         for step_idx, job_vals in enumerate(sequence_data):
             job_dict = {}
             for i, feature_name in enumerate(features):
-                # Apply inverse log transformation if feature was log-transformed
-                if feature_name in skewed_features:
-                    val = np.expm1(job_vals[i]) # exp(x)-1 to revert log(x+1)
-                else:
-                    val = job_vals[i]
+                # all features are now on raw scale
+                val = job_vals[i]
                 
                 job_dict[feature_name] = val
             
@@ -242,6 +257,115 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
             generated_df[col] = np.nan_to_num(generated_df[col], nan=0.0, posinf=np.finfo(np.float64).max, neginf=np.finfo(np.float64).min)
 
     return generated_df
+
+# Helper function to load original data for a given category
+def load_original_dataframe(category):
+    """
+    Loads the original dataframe for a given category.
+    This helper is specifically for the tune_temperatures function.
+    """
+    sheet_name_in_excel = category.replace("category_", "") 
+    original_df_full = pd.read_excel(EXCEL_SUBSET_PATH, sheet_name=sheet_name_in_excel)
+    
+    # Get features from the loaded models to ensure consistency
+    # This assumes 'models' dictionary is accessible or passed.
+    # For simplicity, we'll assume a global 'rvae_models_data' for this helper,
+    # or you can pass 'model_info' as an argument.
+    # For this implementation, we'll retrieve features from the global `rvae_models_data`
+    # which will be loaded by `run_comparison`.
+    
+    # This is a bit of a hack for the helper to work standalone for `tune_temperatures`
+    # outside of `run_comparison`. In a real scenario, `model_info` would be passed.
+    global rvae_models_data
+    features = rvae_models_data[category]['features']
+    original_min_max = rvae_models_data[category]['original_min_max']
+
+    original_df = original_df_full[features].copy()
+
+    for col in original_df.columns:
+        original_df[col] = pd.to_numeric(original_df[col], errors='coerce').fillna(0)
+
+    for feature in features:
+        if feature in original_df.columns:
+            if feature in original_min_max:
+                min_val = original_min_max[feature]['min']
+                max_val = original_min_max[feature]['max']
+                original_df[feature] = np.clip(original_df[feature], min_val, max_val)
+            if feature in ['AllocatedProcessors']:
+                original_df[feature] = original_df[feature].round().astype(int)
+            if feature in ['RunTime', 'AverageCPUTimeUsed', 'UsedMemory', 'AllocatedProcessors']:
+                original_df[feature] = original_df[feature].apply(lambda x: max(0.0, x))
+    
+    for col in original_df.columns:
+        if original_df[col].dtype == 'float64' or original_df[col].dtype == 'float32':
+            original_df[col] = np.nan_to_num(original_df[col], nan=0.0, posinf=np.finfo(np.float64).max, neginf=np.finfo(np.float64).min)
+            
+    return original_df
+
+def tune_temperatures(models,
+                      temps=np.linspace(0.5, 4.0, 15),
+                      n_samples=1000,
+                      seq_len=SEQUENCE_LENGTH):
+    """
+    For each category/model in `models`, sample at each temperature in `temps`,
+    generate `n_samples` synthetic sequences, compute the generated mean of each
+    skewed feature vs. the original, and pick the temperature minimizing
+    the avg absolute mean-diff (%).
+    
+    Returns: dict mapping category -> best_temperature.
+    """
+    best_temps = {}
+    skewed = ['RunTime','AverageCPUTimeUsed']
+    
+    for cat, mdata in models.items():
+        # Ensure load_original_dataframe has access to global `rvae_models_data` or pass info
+        # For this standalone function, assuming rvae_models_data is globally available
+        orig_df = load_original_dataframe(cat)  # your existing helper that loads the real data for this category
+        orig_means = orig_df[skewed].mean()
+
+        best_score = float('inf')
+        best_T       = temps[0]
+        
+        for T in temps:
+            # sample latent with temperature T
+            z = torch.randn(n_samples, mdata['latent_dim'], device=device) * T
+            
+            # Ensure the model is in evaluation mode to disable dropout, batchnorm updates, etc.
+            mdata['model'].eval() 
+            with torch.no_grad(): # Disable gradient calculations for decoding
+                x_dec = mdata['model'].decode(z, sequence_length=seq_len)      # (n_samples, seq_len, n_features)
+            
+            # undo scaling & power-transform exactly as your generate_synthetic_data()
+            flat = x_dec.reshape(-1, len(mdata['features']))
+            
+            # --- FIX: Detach the tensor before converting to NumPy ---
+            unscaled = mdata['scaler'].inverse_transform(flat.cpu().detach().numpy()) # Detach here
+            
+            df_flat = pd.DataFrame(unscaled, columns=mdata['features'])
+            if mdata.get('power_transformer', None) is not None:
+                idx = [i for i,f in enumerate(mdata['features']) if f in skewed]
+                sub_df = pd.DataFrame(unscaled[:, idx], 
+                                      columns=[mdata['features'][i] for i in idx])
+                inv_sub = mdata['power_transformer'].inverse_transform(sub_df)
+                df_flat.iloc[:, idx] = inv_sub
+
+            # reconstruct DataFrame of shape (n_samples*seq_len, features)
+            gen_df = df_flat.groupby(df_flat.index // seq_len).mean() # averaging per-sequence
+            gen_means = gen_df[skewed].mean()
+
+            # compute average absolute mean-diff (%)
+            diffs = (gen_means - orig_means).abs() / orig_means.abs() * 100
+            score = diffs.mean()
+            
+            if score < best_score:
+                best_score = score
+                best_T       = T
+
+        print(f"Category {cat!r}: best T = {best_T:.2f} (avg mean-diff {best_score:.1f}%)")
+        best_temps[cat] = best_T
+
+    return best_temps
+
 
 # --- Numerical Comparison ---
 def numerical_comparison(original_df, generated_df, category, features):
@@ -284,7 +408,7 @@ def numerical_comparison(original_df, generated_df, category, features):
         std_diff_pct = (abs(gen_std - orig_std) / orig_std) * 100 if orig_std != 0 and not np.isnan(orig_std) and np.isfinite(orig_std) else np.nan
 
         comparison_df.loc[feature] = [orig_mean, gen_mean, f"{mean_diff_pct:.2f}%" if not np.isnan(mean_diff_pct) else "N/A",
-                                      orig_std, gen_std, f"{std_diff_pct:.2f}%" if not np.isnan(std_diff_pct) else "N/A"]
+                                       orig_std, gen_std, f"{std_diff_pct:.2f}%" if not np.isnan(std_diff_pct) else "N/A"]
     print(comparison_df)
 
     print("\n--- Kolmogorov-Smirnov (KS) Test (p-value for each feature) ---")
@@ -318,7 +442,7 @@ def numerical_comparison(original_df, generated_df, category, features):
 # --- Visual Comparison ---
 def visual_comparison(original_df, generated_df, category, features):
     """
-    Generates plots for visual comparison (histograms and pair plots).
+    Generates plots for visual comparison (histograms).
     
     Args:
         original_df (pd.DataFrame): DataFrame containing the original data.
@@ -350,24 +474,26 @@ def visual_comparison(original_df, generated_df, category, features):
     if len(all_features_to_compare_visual) == 1:    
         axes_hist = [axes_hist] # Ensure axes_hist is iterable even for a single feature
     
+    # Determine the smaller dataset size for consistent plotting
+    min_samples = min(len(original_df), len(generated_df))
+
     for i, feature in enumerate(all_features_to_compare_visual):
         ax = axes_hist[i]
         
         # Only plot original if the feature exists in original_df and has data
         if feature in original_df.columns:
             original_data_for_plot = original_df[feature].copy()
-            original_data_for_plot = original_data_for_plot[np.isfinite(original_data_for_plot)]
-            if not original_data_for_plot.empty and len(original_data_for_plot.unique()) > 1: # Needs at least 2 unique values for KDE
+            original_data_for_plot = original_data_for_plot[np.isfinite(original_data_for_plot)].sample(n=min_samples, random_state=SEED) # Sample
+            if not original_data_for_plot.empty and len(original_data_for_plot.unique()) > 1:
                 sns.histplot(original_data_for_plot, color='blue', label='Original', kde=True, stat='density', alpha=0.5, ax=ax, bins=50)
-            elif not original_data_for_plot.empty: # Fallback for constant data to just show bar
+            elif not original_data_for_plot.empty:
                 sns.histplot(original_data_for_plot, color='blue', label='Original', stat='density', alpha=0.5, ax=ax, bins=1)
 
-
         generated_data_for_plot = generated_df[feature].copy()
-        generated_data_for_plot = generated_data_for_plot[np.isfinite(generated_data_for_plot)]
+        generated_data_for_plot = generated_data_for_plot[np.isfinite(generated_data_for_plot)].sample(n=min_samples, random_state=SEED) # Sample
         if not generated_data_for_plot.empty and len(generated_data_for_plot.unique()) > 1:
             sns.histplot(generated_data_for_plot, color='red', label='Generated', kde=True, stat='density', alpha=0.5, ax=ax, bins=50)
-        elif not generated_data_for_plot.empty: # Fallback for constant data
+        elif not generated_data_for_plot.empty:
             sns.histplot(generated_data_for_plot, color='red', label='Generated', stat='density', alpha=0.5, ax=ax, bins=1)
         
         ax.set_title(f'Distribution of {feature}')
@@ -376,56 +502,6 @@ def visual_comparison(original_df, generated_df, category, features):
     plt.savefig(f'comparison_plots/{category}_histograms_RVAE.png')
     plt.close(fig_hist)
     print(f"  - Histograms saved to comparison_plots/{category}_histograms_RVAE.png")
-
-    # Pair Plots (limited to a subset of features for readability and performance)
-    if len(all_features_to_compare_visual) > 5:
-        print(f"Skipping pair plots for {category} due to many features ({len(all_features_to_compare_visual)}). Showing first 5.")
-        pair_features = all_features_to_compare_visual[:5]
-    else:
-        pair_features = all_features_to_compare_visual
-
-    print(f"Generating Pair Plots for features: {pair_features}...")
-    
-    # Initialize combined_df structure
-    columns_for_combined_df = pair_features + ['DataSource']
-    combined_data_for_concat = []
-
-    # Process original data for pairplot
-    original_temp_df = original_df[original_df.columns.intersection(pair_features)].copy()
-    original_temp_df['DataSource'] = 'Original'
-    # Ensure all `pair_features` exist, fill with NaN if not present in original_df
-    for col in pair_features:
-        if col not in original_temp_df.columns:
-            original_temp_df[col] = np.nan
-    combined_data_for_concat.append(original_temp_df[columns_for_combined_df]) # Reorder columns and append
-
-    # Process generated data for pairplot
-    generated_temp_df = generated_df[generated_df.columns.intersection(pair_features)].copy()
-    generated_temp_df['DataSource'] = 'Generated'
-    # Ensure all `pair_features` exist, fill with NaN if not present in generated_df
-    for col in pair_features:
-        if col not in generated_temp_df.columns:
-            generated_temp_df[col] = np.nan
-    combined_data_for_concat.append(generated_temp_df[columns_for_combined_df])
-
-    combined_df = pd.concat(combined_data_for_concat, ignore_index=True)
-
-    # Ensure all values are finite for pairplot by replacing NaNs/Infs after all preparations
-    for col in pair_features:
-        if combined_df[col].dtype == 'float64' or combined_df[col].dtype == 'float32':
-             combined_df[col] = np.nan_to_num(combined_df[col], nan=0.0, posinf=np.finfo(np.float64).max, neginf=np.finfo(np.float64).min)
-
-    # Filter out any rows that still contain non-finite values in the selected pair_features
-    combined_df_cleaned = combined_df.dropna(subset=pair_features)
-
-    if not combined_df_cleaned.empty and len(combined_df_cleaned['DataSource'].unique()) > 1: # Ensure both original/generated are present
-        g = sns.pairplot(combined_df_cleaned, hue='DataSource', diag_kind='kde', plot_kws={'alpha':0.6}, vars=pair_features)
-        g.fig.suptitle(f'Pair Plots for Category: {category}', y=1.02, fontsize=16)
-        plt.savefig(f'comparison_plots/{category}_pairplots_RVAE.png')
-        plt.close(g.fig)
-        print(f"  - Pair plots saved to comparison_plots/{category}_pairplots_RVAE.png")
-    else:
-        print(f"  - Skipping pair plots for {category}: Not enough data or categories for comparison.")
 
 
 # Entry point for the script
@@ -437,10 +513,17 @@ def run_comparison():
     os.makedirs('comparison_plots', exist_ok=True) # Create directory for plots
 
     # 1. Load all RVAE models
+    global rvae_models_data # Make this global so tune_temperatures can access it
     rvae_models_data = load_all_rvaes_for_comparison()
     if not rvae_models_data:
         print("No RVAE models loaded. Exiting comparison.")
         return
+
+    # 2. Tune temperatures for all models
+    print("\n--- Tuning Temperatures for VAE Models ---")
+    best_Ts = tune_temperatures(rvae_models_data, seq_len=SEQUENCE_LENGTH)
+    print("\nTemperature tuning complete. Best temperatures per category:")
+    print(best_Ts)
 
     # Process each category/model
     for category_name, model_info in rvae_models_data.items():
@@ -450,8 +533,11 @@ def run_comparison():
         scaler = model_info['scaler']
         features = model_info['features'] # These are the features used for VAE training
         original_min_max = model_info['original_min_max'] # Use this for accurate comparison with original scale
+        
+        # Get the best temperature for this category
+        current_best_T = best_Ts.get(category_name, 1.0) # Default to 1.0 if not found
 
-        # 2. Load original data for this category
+        # 3. Load original data for this category
         try:
             # The sheet name in the Excel file is derived by removing 'category_' prefix.
             sheet_name_in_excel = category_name.replace("category_", "") 
@@ -463,11 +549,6 @@ def run_comparison():
             # Convert to numeric and fill any initial non-numeric values with 0
             for col in original_df.columns:
                 original_df[col] = pd.to_numeric(original_df[col], errors='coerce').fillna(0)
-
-            # --- CORRECTION: Do NOT apply np.expm1 here to original_df. It's already in raw scale. ---
-            # The original data from the Excel file is already in its raw, real-world scale.
-            # Generated data is inverse-transformed to match this raw scale.
-            # So, `original_df` should remain as is, after initial cleaning and type conversion.
             
             # Ensure non-negativity for values that cannot be negative, and clamp to original min/max if available
             for feature in features: # Iterate through features used by VAE
@@ -501,12 +582,10 @@ def run_comparison():
             print(f"Original data for category '{category_name}' is empty. Skipping comparison.")
             continue
 
-        # 3. Generate synthetic data (number of sequences, not jobs)
-        # We generate as many sequences as the original data could form.
+        # 4. Generate synthetic data (number of sequences, not jobs) using the best temperature
         num_original_sequences = max(0, len(original_df) - SEQUENCE_LENGTH + 1)
         
-        # Ensure we generate a reasonable number of sequences, at least one if possible.
-        if num_original_sequences == 0 and len(original_df) >= 1: # If original data is too short for a full sequence, generate at least one.
+        if num_original_sequences == 0 and len(original_df) >= 1:
             num_sequences_to_generate = 1
         else:
             num_sequences_to_generate = num_original_sequences
@@ -515,17 +594,17 @@ def run_comparison():
             print(f"Not enough original data ({len(original_df)} jobs) to generate even one sequence of length {SEQUENCE_LENGTH}. Skipping generation for {category_name}.")
             continue
 
-        generated_df = generate_synthetic_data(model_info, num_sequences_to_generate, SEQUENCE_LENGTH)
-        print(f"Generated {len(generated_df)} synthetic jobs (from {num_sequences_to_generate} sequences) for '{category_name}'.")
+        generated_df = generate_synthetic_data(model_info, num_sequences_to_generate, SEQUENCE_LENGTH, temperature=current_best_T)
+        print(f"Generated {len(generated_df)} synthetic jobs (from {num_sequences_to_generate} sequences) for '{category_name}' with temperature {current_best_T:.2f}.")
 
         if generated_df.empty:
             print(f"Generated data for category '{category_name}' is empty. Skipping comparison.")
             continue
         
-        # 4. Perform Numerical Comparison
+        # 5. Perform Numerical Comparison
         numerical_comparison(original_df, generated_df, category_name, features)
 
-        # 5. Perform Visual Comparison
+        # 6. Perform Visual Comparison
         visual_comparison(original_df, generated_df, category_name, features)
         
     print("\nComparison complete. Check 'comparison_plots' directory for visualizations.")

@@ -24,7 +24,7 @@ GRAD_CLIP_NORM = 5.0 # Maximum norm for gradient clipping
 MIN_TRAINING_SIZE = 200 # Minimum number of samples required to train a VAE for a category
 SEED = 42 # Random seed for reproducibility
 SEQUENCE_LENGTH = 10 # Length of sequences for Recurrent VAEs (RVAEs)
-
+ANOMALY_PCT=1
 # --- SIMULATION CONFIG ---
 FLASK_API_URL = "http://127.0.0.1:5000/simulate" # URL for the simulation API
 DEFAULT_SIM_JOBS = 1000 # Default number of jobs to simulate
