@@ -22,7 +22,8 @@ from swf_utils.swf_categorizer2 import (
     compute_user_burst_metrics,
     calculate_interval_burstiness,
     determine_burstiness_thresholds,
-    classify_job
+    classify_job,
+    
 )
 
 # Make sure your vae_training.py and train_all_vaes.py are accessible
@@ -47,7 +48,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 SWF_PATH = "/home/poornav/cloudsim-simulator/SDSC-SP2-1998-4.2-cln.swf"
-ANOMALY_PCT = 1.0
+#ANOMALY_PCT = 1.0
 BURST_THRESHOLD_SECONDS = 60 # Max seconds between jobs to be in the same burst
 SUBSETS_DIR = os.path.join(BASE_DIR, "subsets")
 WEIGHTS_DIR = os.path.join(BASE_DIR, "vae_models")
@@ -70,7 +71,9 @@ user_burstiness_edges = []
 # ─── 1) PARSE SWF & COMPUTE GLOBAL BIN EDGES ──────────────────────────────
 logging.info("[INIT] Parsing SWF and computing global bin edges...")
 df_all = parse_sdsc_sp2_log(SWF_PATH)
-_, df_clean = detect_and_remove_anomalies(df_all, ANOMALY_PCT / 100.0)
+
+#JOHN TUKEY FOR OUTLIER DETECTION
+_, df_clean = detect_and_remove_anomalies(df_all) # Set to 1% as a starting point
 
 # Compute VAEs' runtime/cpu edges
 RT_EDGES, CPU_EDGES = compute_bin_edges(df_clean)

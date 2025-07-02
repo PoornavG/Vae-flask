@@ -12,7 +12,7 @@ from scipy.stats import ks_2samp, wasserstein_distance
 N_SAMPLES   = 1000  # max points per dataset
 BASE_DIR    = os.path.dirname(__file__)
 REAL_DIR    = os.path.join(BASE_DIR, 'subsets')
-SYN_PATTERN = os.path.join(BASE_DIR, '*_synthetic_500.xlsx')
+SYN_PATTERN = os.path.join(BASE_DIR, 'synthetic_data_for_comparison', '*_synthetic_500.xlsx')
 OUT_DIR     = os.path.join(BASE_DIR, 'comparison_reports')
 os.makedirs(OUT_DIR, exist_ok=True)
 
