@@ -4,7 +4,7 @@ import torch
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.tensorboard import SummaryWriter
-
+import torch.nn.functional
 # --- FIXED: Import the correct functions from swf_categorizer3.py ---
 from swf_utils.swf_categorizer3 import (
     parse_sdsc_sp2_log,
@@ -135,7 +135,7 @@ def train_all_vaes():
             optimizer, scheduler,
             epochs=EPOCHS,
             patience=PATIENCE,
-            writer=writer,
+            writer=writer,features=feats,
         )
         writer.close()
 

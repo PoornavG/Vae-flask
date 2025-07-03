@@ -180,81 +180,122 @@ def vae_loss(reconstructed_x, x, mu, logvar, kl_weight):
 KL_ANNEAL_EPOCHS = 30 # This will be effectively replaced by warmup_epochs
 GRAD_CLIP_NORM = 1.0
 # Training function
-def train_vae(model, train_loader, val_loader, optimizer, scheduler, epochs, patience, writer):
+def train_vae(model,
+              train_loader,
+              val_loader,
+              optimizer,
+              scheduler,
+              epochs,
+              patience,
+              writer,
+              features):
+    """
+    Trains the VAE with:
+      - KL warm‑up (beta) over warmup_epochs
+      - variance‑matching penalty on skewed features
+      - early stopping on validation loss
+    """
     device = next(model.parameters()).device
     best_val_loss = float('inf')
     epochs_no_improve = 0
 
+    # Hyperparameters
+    target_beta    = 0.1       # final weight on KL term
+    warmup_epochs  = 30        # epochs to linearly ramp beta from 0→target_beta
+    lambda_var     = 0.1      # weight for variance‑matching loss
+    skewed_feats   = ['RunTime', 'AverageCPUTimeUsed']
+
     print(f"Starting training on {device}...")
 
-    # hyperparameters from the diff
-    target_beta = 0.1      # how much weight to give KL relative to recon
-    warmup_epochs = 30     # linearly ramp beta from 0->target_beta over these epochs
-
     for epoch in range(epochs):
-        # linear warm-up schedule for beta (KL weight)
-        if epoch < warmup_epochs: # Use epoch < warmup_epochs as epoch starts from 0
-            beta = target_beta * ((epoch + 1) / warmup_epochs) # epoch + 1 to avoid 0 beta in first epoch
+        # 1) Compute beta for this epoch (linear warm‑up)
+        if epoch < warmup_epochs:
+            beta = target_beta * float(epoch + 1) / warmup_epochs
         else:
             beta = target_beta
-        
-        # Log the current beta value
         writer.add_scalar('Hyperparameters/beta', beta, epoch)
 
+        # ----- Training -----
         model.train()
-        train_loss = 0
-        for batch_idx, data in enumerate(train_loader):
+        train_loss = 0.0
+        for data in train_loader:
             data = data.to(device)
             optimizer.zero_grad()
-            
-            reconstructed_data, mu, log_var = model(data)
-            
-            # Use the calculated beta as kl_weight
-            loss = vae_loss(reconstructed_data, data, mu, log_var, kl_weight=beta)
+
+            # Forward pass
+            reconstructed, mu, logvar = model(data)
+
+            # Reconstruction loss (sum‑reduction)
+            recon_loss = torch.nn.functional.mse_loss(
+                reconstructed, data, reduction='sum'
+            )
+            # KL divergence
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+            # Variance‑matching penalty
+            # flatten batch and time dims: (B*T, F)
+            B, T, Fdim = reconstructed.shape
+            rec_flat = reconstructed.view(-1, Fdim)
+            real_flat = data.view(-1, Fdim)
+
+            # get indices of skewed features
+            idx = [features.index(f) for f in skewed_feats if f in features]
+            if idx:
+                var_real = real_flat[:, idx].var(dim=0, unbiased=False)
+                var_gen  = rec_flat[:, idx].var(dim=0, unbiased=False)
+                var_loss = torch.mean((var_gen - var_real).pow(2))
+            else:
+                var_loss = torch.tensor(0.0, device=device)
+
+            # Total loss
+            loss = recon_loss + beta * kl_loss + lambda_var * var_loss
             loss.backward()
-            
+
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-            
             optimizer.step()
+
             train_loss += loss.item()
-        
-        avg_train_loss = train_loss / len(train_loader.dataset) # This assumes vae_loss is sum-reduced per batch
+
+        avg_train_loss = train_loss / len(train_loader.dataset)
         writer.add_scalar('Loss/train', avg_train_loss, epoch)
 
-        # Validation
+        # ----- Validation -----
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         with torch.no_grad():
             for data in val_loader:
                 data = data.to(device)
-                reconstructed_data, mu, log_var = model(data)
-                # For validation, typically you'd use the full target_beta or 1.0 for KL weight
-                # The diff uses full weight for validation (implied by no beta calculation for validation)
-                # Let's stick to target_beta for consistency with the training phase's eventual beta.
-                loss = vae_loss(reconstructed_data, data, mu, log_var, kl_weight=target_beta) 
+                reconstructed, mu, logvar = model(data)
+                # Use final beta for validation
+                recon_loss = torch.nn.functional.mse_loss(
+                    reconstructed, data, reduction='sum'
+                )
+                kl_loss     = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = recon_loss + target_beta * kl_loss
                 val_loss += loss.item()
-        
-        avg_val_loss = val_loss / len(val_loader.dataset) # This assumes vae_loss is sum-reduced per batch
+
+        avg_val_loss = val_loss / len(val_loader.dataset)
         writer.add_scalar('Loss/val', avg_val_loss, epoch)
-        
         scheduler.step(avg_val_loss)
 
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Beta: {beta:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}  "
+              f"Train Loss: {avg_train_loss:.4f}  "
+              f"Val Loss: {avg_val_loss:.4f}  "
+              f"β={beta:.3f}")
 
         # Early stopping
         if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+            best_val_loss    = avg_val_loss
             epochs_no_improve = 0
-            # Save the best model state (optional, as the original comment says final state is saved)
-            # torch.save(model.state_dict(), 'best_vae_model.pth') 
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f"Early stopping triggered after {patience} epochs with no improvement.")
+                print(f"Early stopping after {patience} epochs with no improvement.")
                 break
-                
+
     return model
+
 
 # --- UPDATED load_and_preprocess function ---
 def load_and_preprocess(path, features, sheet_name=0, drop_thresh=0.5, sequence_length=10):
