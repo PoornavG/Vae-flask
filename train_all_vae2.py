@@ -22,13 +22,13 @@ from vae_training3 import (
 )
 from config import (
     DEFAULT_LATENT_DIM, ANOMALY_LATENT_DIM, HIDDEN_DIMS,
-    BATCH_SIZE, EPOCHS, PATIENCE, LEARNING_RATE,
+    BATCH_SIZE, EPOCHS, PATIENCE, LEARNING_RATE,SWF_PATH,
     WEIGHTS_DIR, KL_ANNEAL_EPOCHS, GRAD_CLIP_NORM,
     MIN_TRAINING_SIZE # Also include MIN_TRAINING_SIZE
 )
 
 # ───────── CONFIG ─────────
-SWF_PATH    = "/home/poornav/cloudsim-simulator/SDSC-SP2-1998-4.2-cln.swf"
+
 ANOMALY_PCT = 1.0
 SUBSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subsets")
 MIN_SIZE    = 200
@@ -76,8 +76,42 @@ def export_subsets_to_excel():
     )
 
     category_counts = categorized_df['Category'].value_counts()
-    valid_categories = category_counts[category_counts >= 100].index  # e.g., keep only those with 100+ jobs
-    filtered_df = categorized_df[categorized_df['Category'].isin(valid_categories)]
+    threshold = 500
+    sparse_categories = category_counts[category_counts < threshold].index
+    valid_categories = category_counts[category_counts >= threshold].index
+
+    def parse_cat(cat):
+        # Example: RT_2_CPU_3_BURST_1
+        parts = cat.split('_')
+        return int(parts[1]), int(parts[3]), int(parts[5])
+
+    def find_nearest_valid(cat, valid_cats):
+        rt, cpu, burst = parse_cat(cat)
+        min_dist = float('inf')
+        best_cat = cat
+        for vcat in valid_cats:
+            vrt, vcpu, vburst = parse_cat(vcat)
+            dist = abs(rt - vrt) + abs(cpu - vcpu) + abs(burst - vburst)
+            if dist < min_dist:
+                min_dist = dist
+                best_cat = vcat
+        return best_cat
+
+    # Build reassignment map
+    reassignment_map = {
+        sparse: find_nearest_valid(sparse, valid_categories)
+        for sparse in sparse_categories
+    }
+
+    # Apply reassignment
+    categorized_df['Category'] = categorized_df['Category'].apply(
+        lambda c: reassignment_map.get(c, c)
+    )
+
+    # Re-count after reassignment
+    final_counts = categorized_df['Category'].value_counts()
+    final_valid_cats = final_counts[final_counts >= threshold].index
+    filtered_df = categorized_df[categorized_df['Category'].isin(final_valid_cats)]
 
     # Export categorized subsets to an Excel file
     excel_path = os.path.join(SUBSETS_DIR, 'categorized_subsets.xlsx')

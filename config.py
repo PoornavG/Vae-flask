@@ -8,7 +8,7 @@ DATA_DIR = "generated_data" # Directory for generated data
 WEIGHTS_DIR = 'vae_models' # Directory for VAE model weights
 SUBSETS_DIR = "subsets" # Directory for data subsets
 LOG_DIR = "runs" # Directory for training logs
-SWF_PATH = "/home/poornav/cloudsim-simulator/SDSC-SP2-1998-4.2-cln.swf" # Path to the SWF dataset
+SWF_PATH = r"/home/poornav/cloudsim-simulator/LANL-CM5-1994-4.1-cln.swf" # Path to the SWF dataset
 EXCEL_SUBSET_PATH = os.path.join(SUBSETS_DIR, "categorized_subsets.xlsx") # Path to categorized subsets in Excel
 
 # --- VAE HYPERPARAMETERS ---

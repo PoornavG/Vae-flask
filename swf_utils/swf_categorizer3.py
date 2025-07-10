@@ -7,10 +7,11 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import gamma
 import json
-from collections import defaultdict
+from collections import defaultdict,Counter
 from sklearn.ensemble import IsolationForest
 import sys
-
+import json
+DEFAULT_GRANULARITY='hour'
 # Add the project's root directory to the Python path
 # This ensures that `config` can be imported regardless of the current working directory
 try:
@@ -360,8 +361,42 @@ def export_subsets_to_excel(df_clean, subsets_dir="subsets"):
         burst_count_edges=burst_count_edges
     )
     category_counts = categorized_df['Category'].value_counts()
-    valid_categories = category_counts[category_counts >= 100].index  # e.g., keep only those with 100+ jobs
-    filtered_df = categorized_df[categorized_df['Category'].isin(valid_categories)]
+    threshold = 500
+    sparse_categories = category_counts[category_counts < threshold].index
+    valid_categories = category_counts[category_counts >= threshold].index
+
+    def parse_cat(cat):
+        # Example: RT_2_CPU_3_BURST_1
+        parts = cat.split('_')
+        return int(parts[1]), int(parts[3]), int(parts[5])
+
+    def find_nearest_valid(cat, valid_cats):
+        rt, cpu, burst = parse_cat(cat)
+        min_dist = float('inf')
+        best_cat = cat
+        for vcat in valid_cats:
+            vrt, vcpu, vburst = parse_cat(vcat)
+            dist = abs(rt - vrt) + abs(cpu - vcpu) + abs(burst - vburst)
+            if dist < min_dist:
+                min_dist = dist
+                best_cat = vcat
+        return best_cat
+
+    # Build reassignment map
+    reassignment_map = {
+        sparse: find_nearest_valid(sparse, valid_categories)
+        for sparse in sparse_categories
+    }
+
+    # Apply reassignment
+    categorized_df['Category'] = categorized_df['Category'].apply(
+        lambda c: reassignment_map.get(c, c)
+    )
+
+    # Re-count after reassignment
+    final_counts = categorized_df['Category'].value_counts()
+    final_valid_cats = final_counts[final_counts >= threshold].index
+    filtered_df = categorized_df[categorized_df['Category'].isin(final_valid_cats)]
 
     # 4. Export subsets to Excel
     writer = pd.ExcelWriter(os.path.join(subsets_dir, "categorized_subsets.xlsx"))
@@ -403,6 +438,59 @@ def main():
 
     # 4. Export categorized subsets for VAE training
     export_subsets_to_excel(clean_data)
+    # ─── Export the time→category distribution ─────────────────────────────────
+    from collections import defaultdict
+    granularity_minutes=10
+    # 1) tag each job with its weekday and bucketed time
+    bucket_freq = f"{granularity_minutes}T"   # e.g. "10T" for 10‑minute
+    clean_data['Day'] = clean_data['SubmitTime'].dt.day_name()
+    clean_data['TimeBucket'] = (
+        clean_data['SubmitTime']
+        .dt.floor(bucket_freq)
+        .dt.strftime('%H:%M')
+    )
+
+    # 2) group & count
+    grp = (
+        clean_data
+        .groupby(['Day', 'TimeBucket', 'Category'])
+        .size()
+        .reset_index(name='Count')
+    )
+
+    # 3) assemble nested dict
+    category_distribution = defaultdict(lambda: defaultdict(dict))
+    for _, row in grp.iterrows():
+        day = row['Day']
+        tb  = row['TimeBucket']
+        cat = row['Category']
+        cnt = int(row['Count'])
+        category_distribution[day][tb][cat] = cnt
+
+    # ─── Export the time→category distribution ─────────────────────────────────
+    TIME_DIST_FILE = "time_category_distribution.json"
+        # ─── NEW: compute how many jobs each real user submitted per category
+    category_user_counts = defaultdict(Counter)
+    for _, row in clean_data.iterrows():
+        cat = row['Category']
+        uid = row['UserID']
+        category_user_counts[cat][uid] += 1
+
+    # Convert Counters to simple dicts of {userID: count}
+    category_user_counts = {
+        cat: dict(counter)
+        for cat, counter in category_user_counts.items()
+    }
+
+    out = {
+        "category_distribution":    category_distribution,
+        "granularity_minutes":      granularity_minutes,
+        "category_user_counts":     category_user_counts   # ← include it here
+    }
+    with open(TIME_DIST_FILE, 'w') as f:
+        json.dump(out, f, indent=4)
+    logger.info(f"Time–category distribution exported to '{TIME_DIST_FILE}'")
+
     
 if __name__ == '__main__':
     main()

@@ -259,48 +259,30 @@ def generate_synthetic_data(model_data, num_sequences_to_generate, sequence_leng
     return generated_df
 
 # Helper function to load original data for a given category
-def load_original_dataframe(category):
+def load_original_dataframe(category, models):
     """
-    Loads the original dataframe for a given category.
-    This helper is specifically for the tune_temperatures function.
+    Loads the original dataframe for a given category,
+    using the features & original_min_max from `models[category]`.
     """
-    sheet_name_in_excel = category.replace("category_", "") 
-    original_df_full = pd.read_excel(EXCEL_SUBSET_PATH, sheet_name=sheet_name_in_excel)
-    
-    # Get features from the loaded models to ensure consistency
-    # This assumes 'models' dictionary is accessible or passed.
-    # For simplicity, we'll assume a global 'rvae_models_data' for this helper,
-    # or you can pass 'model_info' as an argument.
-    # For this implementation, we'll retrieve features from the global `rvae_models_data`
-    # which will be loaded by `run_comparison`.
-    
-    # This is a bit of a hack for the helper to work standalone for `tune_temperatures`
-    # outside of `run_comparison`. In a real scenario, `model_info` would be passed.
-    global rvae_models_data
-    features = rvae_models_data[category]['features']
-    original_min_max = rvae_models_data[category]['original_min_max']
+    # read the Excel subset
+    sheet = category.replace("category_", "")
+    df_full = pd.read_excel(EXCEL_SUBSET_PATH, sheet_name=sheet)
 
-    original_df = original_df_full[features].copy()
+    # pull metadata from the passed-in dict
+    feats = models[category]['features']
+    orig_mm = models[category]['original_min_max']
 
-    for col in original_df.columns:
-        original_df[col] = pd.to_numeric(original_df[col], errors='coerce').fillna(0)
+    # subset + clean/clamp as before
+    orig = df_full[feats].apply(pd.to_numeric, errors='coerce').fillna(0)
+    for f in feats:
+        if f in orig_mm:
+            orig[f] = orig[f].clip(orig_mm[f]['min'], orig_mm[f]['max'])
+        if f in ['AllocatedProcessors']:
+            orig[f] = orig[f].round().astype(int)
+        if f in ['RunTime','AverageCPUTimeUsed','UsedMemory','AllocatedProcessors']:
+            orig[f] = orig[f].clip(lower=0.0)
+    return orig
 
-    for feature in features:
-        if feature in original_df.columns:
-            if feature in original_min_max:
-                min_val = original_min_max[feature]['min']
-                max_val = original_min_max[feature]['max']
-                original_df[feature] = np.clip(original_df[feature], min_val, max_val)
-            if feature in ['AllocatedProcessors']:
-                original_df[feature] = original_df[feature].round().astype(int)
-            if feature in ['RunTime', 'AverageCPUTimeUsed', 'UsedMemory', 'AllocatedProcessors']:
-                original_df[feature] = original_df[feature].apply(lambda x: max(0.0, x))
-    
-    for col in original_df.columns:
-        if original_df[col].dtype == 'float64' or original_df[col].dtype == 'float32':
-            original_df[col] = np.nan_to_num(original_df[col], nan=0.0, posinf=np.finfo(np.float64).max, neginf=np.finfo(np.float64).min)
-            
-    return original_df
 
 def tune_temperatures(models,
                       temps=np.linspace(0.5, 4.0, 15),
@@ -308,60 +290,76 @@ def tune_temperatures(models,
                       seq_len=SEQUENCE_LENGTH):
     """
     For each category/model in `models`, sample at each temperature in `temps`,
-    generate `n_samples` synthetic sequences, compute the generated mean of each
-    skewed feature vs. the original, and pick the temperature minimizing
-    the avg absolute mean-diff (%).
-    
+    generate `n_samples` synthetic sequences, compute the generated mean and std
+    of each skewed feature vs. the original, and pick the temperature minimizing
+    the total mean + std absolute diff (in %).
+
+    Also includes a lightweight std boosting correction if needed.
+
     Returns: dict mapping category -> best_temperature.
     """
     best_temps = {}
-    skewed = ['RunTime','AverageCPUTimeUsed']
-    
+    skewed = ['RunTime', 'AverageCPUTimeUsed']
+
     for cat, mdata in models.items():
-        # Ensure load_original_dataframe has access to global `rvae_models_data` or pass info
-        # For this standalone function, assuming rvae_models_data is globally available
-        orig_df = load_original_dataframe(cat)  # your existing helper that loads the real data for this category
+        orig_df = load_original_dataframe(cat, models)
         orig_means = orig_df[skewed].mean()
+        orig_stds = orig_df[skewed].std()
 
         best_score = float('inf')
-        best_T       = temps[0]
-        
+        best_T = temps[0]
+
         for T in temps:
             # sample latent with temperature T
             z = torch.randn(n_samples, mdata['latent_dim'], device=device) * T
-            
-            # Ensure the model is in evaluation mode to disable dropout, batchnorm updates, etc.
-            mdata['model'].eval() 
-            with torch.no_grad(): # Disable gradient calculations for decoding
-                x_dec = mdata['model'].decode(z, sequence_length=seq_len)      # (n_samples, seq_len, n_features)
-            
-            # undo scaling & power-transform exactly as your generate_synthetic_data()
+
+            mdata['model'].eval()
+            with torch.no_grad():
+                x_dec = mdata['model'].decode(z, sequence_length=seq_len)
+
             flat = x_dec.reshape(-1, len(mdata['features']))
-            
-            # --- FIX: Detach the tensor before converting to NumPy ---
-            unscaled = mdata['scaler'].inverse_transform(flat.cpu().detach().numpy()) # Detach here
-            
+            unscaled = mdata['scaler'].inverse_transform(flat.cpu().detach().numpy())
             df_flat = pd.DataFrame(unscaled, columns=mdata['features'])
+
+            # Apply inverse power-transform (if used)
             if mdata.get('power_transformer', None) is not None:
-                idx = [i for i,f in enumerate(mdata['features']) if f in skewed]
-                sub_df = pd.DataFrame(unscaled[:, idx], 
+                idx = [i for i, f in enumerate(mdata['features']) if f in skewed]
+                sub_df = pd.DataFrame(unscaled[:, idx],
                                       columns=[mdata['features'][i] for i in idx])
                 inv_sub = mdata['power_transformer'].inverse_transform(sub_df)
                 df_flat.iloc[:, idx] = inv_sub
 
-            # reconstruct DataFrame of shape (n_samples*seq_len, features)
-            gen_df = df_flat.groupby(df_flat.index // seq_len).mean() # averaging per-sequence
-            gen_means = gen_df[skewed].mean()
+            # Optional variance boost to underdispersed skewed features
+            for feat in skewed:
+                gen_std = df_flat[feat].std()
+                orig_std = orig_stds[feat]
+                std_diff_pct = abs(gen_std - orig_std) / orig_std * 100
 
-            # compute average absolute mean-diff (%)
-            diffs = (gen_means - orig_means).abs() / orig_means.abs() * 100
-            score = diffs.mean()
-            
+                if gen_std < orig_std and std_diff_pct > 40:
+                    correction_std = (orig_std - gen_std) * 0.75  # dampen noise
+                    print(f"[{cat}] Boosting std of '{feat}' by ~{correction_std:.3f}")
+                    df_flat[feat] += np.random.normal(
+                        loc=0.0,
+                        scale=correction_std,
+                        size=df_flat.shape[0]
+                    )
+
+            # Average over each full sequence
+            gen_df = df_flat.groupby(df_flat.index // seq_len).mean()
+            gen_means = gen_df[skewed].mean()
+            gen_stds = gen_df[skewed].std()
+
+            # Percent error in mean and std
+            mean_diffs = (gen_means - orig_means).abs() / orig_means.abs() * 100
+            std_diffs = (gen_stds - orig_stds).abs() / orig_stds.abs() * 100
+
+            score = mean_diffs.mean() + std_diffs.mean()
+
             if score < best_score:
                 best_score = score
-                best_T       = T
+                best_T = T
 
-        print(f"Category {cat!r}: best T = {best_T:.2f} (avg mean-diff {best_score:.1f}%)")
+        print(f"Category {cat!r}: best T = {best_T:.2f} (score: {best_score:.2f}%)")
         best_temps[cat] = best_T
 
     return best_temps
@@ -583,20 +581,30 @@ def run_comparison():
             continue
 
         # 4. Generate synthetic data (number of sequences, not jobs) using the best temperature
-        num_original_sequences = max(0, len(original_df) - SEQUENCE_LENGTH + 1)
-        
-        if num_original_sequences == 0 and len(original_df) >= 1:
-            num_sequences_to_generate = 1
-        else:
-            num_sequences_to_generate = num_original_sequences
-            
-        if num_sequences_to_generate == 0:
-            print(f"Not enough original data ({len(original_df)} jobs) to generate even one sequence of length {SEQUENCE_LENGTH}. Skipping generation for {category_name}.")
+        # 4. Generate synthetic data (targetting equal number of jobs) using the best temperature
+        target_num_generated_jobs = len(original_df)
+
+        if target_num_generated_jobs == 0:
+            print(f"Original data for category '{category_name}' is empty. Skipping generation.")
             continue
 
-        generated_df = generate_synthetic_data(model_info, num_sequences_to_generate, SEQUENCE_LENGTH, temperature=current_best_T)
-        print(f"Generated {len(generated_df)} synthetic jobs (from {num_sequences_to_generate} sequences) for '{category_name}' with temperature {current_best_T:.2f}.")
+        # Calculate how many sequences are needed to reach or exceed the target number of jobs
+        # Use ceil to ensure we generate at least the target number of jobs,
+        # even if it means generating slightly more than original_df length due to SEQUENCE_LENGTH
+        num_sequences_to_generate = int(np.ceil(target_num_generated_jobs / SEQUENCE_LENGTH))
 
+        if num_sequences_to_generate == 0: # This case should ideally not happen if target_num_generated_jobs > 0
+            num_sequences_to_generate = 1 # Ensure at least one sequence is generated if target is small
+
+        generated_df = generate_synthetic_data(model_info, num_sequences_to_generate, SEQUENCE_LENGTH, temperature=current_best_T)
+
+        # Crucially, trim the generated data to exactly match the original number of samples
+        if len(generated_df) > target_num_generated_jobs:
+            generated_df = generated_df.head(target_num_generated_jobs)
+        elif len(generated_df) < target_num_generated_jobs:
+            print(f"Warning: Generated fewer jobs ({len(generated_df)}) than target ({target_num_generated_jobs}) for '{category_name}'. This might happen if num_sequences_to_generate was very small.")
+
+        print(f"Generated {len(generated_df)} synthetic jobs (targeting {target_num_generated_jobs} original jobs) for '{category_name}' with temperature {current_best_T:.2f}.")
         if generated_df.empty:
             print(f"Generated data for category '{category_name}' is empty. Skipping comparison.")
             continue
