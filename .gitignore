@@ -3,73 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# C extensions
-*.so
-
 # Virtual environment
 venv/
-env/
 
-# Distribution / packaging
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
+# Ignore all folders except swf_utils
+/*/
+!/swf_utils/
 
-# PyInstaller
-*.manifest
-*.spec
+# Optional: if swf_utils contains nested folders you want to include
+!/swf_utils/**
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# VS Code
-.vscode/
-
-# PyCharm
-.idea/
-
-# macOS
-.DS_Store
-
-# Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-
-# Zone.Identifier files (Windows security metadata)
 *Zone.Identifier
-
-# Logs
-*.log
-
-# Generated data folders
-generated_data/
-synthetic_data_for_comparison/
-comparison_plots/
-subsets/
-plots/
-runs/
