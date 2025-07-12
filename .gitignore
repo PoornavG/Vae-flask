@@ -13,4 +13,4 @@ venv/
 # Optional: if swf_utils contains nested folders you want to include
 !/swf_utils/**
 
-*.Zone.Identifier
+*:Zone.Identifier
