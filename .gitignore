@@ -13,4 +13,5 @@ venv/
 # Optional: if swf_utils contains nested folders you want to include
 !/swf_utils/**
 
+vae_models/
 *Zone.Identifier
