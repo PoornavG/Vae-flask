@@ -468,28 +468,56 @@ def main():
         category_distribution[day][tb][cat] = cnt
 
     # ─── Export the time→category distribution ─────────────────────────────────
+    from collections import defaultdict, Counter
+
+# ─── Export the time→category distribution (with per-slot user counts) ───
     TIME_DIST_FILE = "time_category_distribution.json"
-        # ─── NEW: compute how many jobs each real user submitted per category
-    category_user_counts = defaultdict(Counter)
+    granularity_minutes = 10
+    bucket_freq = f"{granularity_minutes}T"  # e.g., "10T" for 10-minute intervals
+
+    # 1️⃣ Add Day and TimeBucket columns
+    clean_data["Day"] = clean_data["SubmitTime"].dt.day_name()
+    clean_data["TimeBucket"] = clean_data["SubmitTime"].dt.floor(bucket_freq).dt.strftime('%H:%M')
+
+    # 2️⃣ Build nested structure with category_counts and user_counts
+    category_distribution = defaultdict(lambda: defaultdict(lambda: {
+        "category_counts": Counter(),
+        "user_counts": defaultdict(Counter)
+    }))
+
     for _, row in clean_data.iterrows():
-        cat = row['Category']
-        uid = row['UserID']
-        category_user_counts[cat][uid] += 1
+        day = row["Day"]
+        time_bucket = row["TimeBucket"]
+        category = row["Category"]
+        user_id = row["UserID"]
 
-    # Convert Counters to simple dicts of {userID: count}
-    category_user_counts = {
-        cat: dict(counter)
-        for cat, counter in category_user_counts.items()
-    }
+        slot = category_distribution[day][time_bucket]
+        slot["category_counts"][category] += 1
+        slot["user_counts"][category][user_id] += 1
 
+    # 3️⃣ Convert all Counters to plain dicts for JSON serialization
+    def convert_nested_counters(obj):
+        if isinstance(obj, Counter):
+            return dict(obj)
+        elif isinstance(obj, defaultdict):
+            return {k: convert_nested_counters(v) for k, v in obj.items()}
+        elif isinstance(obj, dict):
+            return {k: convert_nested_counters(v) for k, v in obj.items()}
+        return obj
+
+    category_distribution = convert_nested_counters(category_distribution)
+
+    # 4️⃣ Final output JSON
     out = {
-        "category_distribution":    category_distribution,
-        "granularity_minutes":      granularity_minutes,
-        "category_user_counts":     category_user_counts   # ← include it here
+        "granularity_minutes": granularity_minutes,
+        "category_distribution": category_distribution
     }
-    with open(TIME_DIST_FILE, 'w') as f:
+
+    with open(TIME_DIST_FILE, "w") as f:
         json.dump(out, f, indent=4)
-    logger.info(f"Time–category distribution exported to '{TIME_DIST_FILE}'")
+
+    logger.info(f"Time–category distribution (with per-slot user counts) exported to '{TIME_DIST_FILE}'")
+
 
     
 if __name__ == '__main__':

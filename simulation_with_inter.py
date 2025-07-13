@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 import glob
 import json 
 import sys # Added sys for path modification
+import pprint
 
 from flask import Flask, request, jsonify, abort
 import pandas as pd
@@ -114,6 +115,17 @@ TIME_CATEGORY_DIST_FILE = "time_category_distribution.json"
 # Lock for user profile access (if modified concurrently)
 profile_lock = threading.Lock()
 
+# ------------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------------
+def build_sampling_arrays(u2c: dict):
+    """
+    Convert {"42": 17, "99": 3, ...}  →  ( [42, 99, ...], [0.85, 0.15, ...] )
+    """
+    users  = np.fromiter((int(uid) for uid in u2c.keys()), dtype=int)
+    counts = np.fromiter(u2c.values(),            dtype=float)
+    probs  = counts / counts.sum() if counts.sum() else np.ones_like(counts) / len(counts)
+    return users, probs
 
 # ─── MMPP GENERATOR ───────────────────────────────────────────────────────
 # (Keep this as is, it's a utility for generating inter-arrival times)
@@ -146,6 +158,21 @@ def generate_mmpp_interarrival_time(num_jobs_to_generate, current_burst_level):
         current_state_idx = next_state_idx
     
     return inter_arrival_times
+
+# ─── HELPER: map category suffix to burst string ──────────────────────────
+def burst_from_category(category: str) -> str:
+    """
+    Derive 'Low' | 'Mid' | 'High' from a category string such as
+    'RT_2_CPU_1_BURST_3'.
+    """
+    if category is None:
+        return "Low"
+    if "BURST_3" in category:
+        return "High"
+    elif "BURST_2" in category:
+        return "Mid"
+    else:
+        return "Low"
 
 
 # ─── VAE MODEL LOADING ────────────────────────────────────────────────────
@@ -266,60 +293,109 @@ def get_category_for_time_slot(day, current_time_str):
 
 # ─── CORE JOB SAMPLING LOGIC ──────────────────────────────────────────────
 # (This is the most critical function and has been updated for sequence VAEs)
-def sample_valid_jobs_for_user(model_info, need, burst_level, category):    # Extract metadata
-    m = model_info['model']
-    scaler = model_info['scaler']
-    pt = model_info['power_transformer']
-    feats = model_info['features']
-    seq_len = model_info['sequence_length']
-    latent = model_info['latent_dim']
-    orig_mm = model_info['original_min_max']
+def sample_valid_jobs_for_user(
+    model_info: dict,
+    need: int,
+    burst_level: str,
+    category: str
+) -> list[dict]:
+    """
+    Generate `need` synthetic jobs for a single category with
+    resource values decoded from that category's VAE.
 
-    T = float(temperature_map.get(category, 1.0))
-    # how many sequences we need
-    num_seq = max(1, int(np.ceil(need/seq_len)))
-    jobs = []
+    Parameters
+    ----------
+    model_info : dict
+        Dictionary returned by load_all_vaes()[category].
+    need : int
+        Total number of jobs requested.
+    burst_level : str
+        'Low' | 'Mid' | 'High' – used for the MMPP inter‑arrival sampler.
+    category : str
+        Category being generated (e.g. 'RT_2_CPU_1_BURST_3').
+
+    Returns
+    -------
+    list[dict]
+        List of job dictionaries ready to be JSON‑serialised.
+    """
+
+    # ── 0. Unpack model metas ────────────────────────────────────────────
+    m            = model_info['model']
+    scaler       = model_info['scaler']
+    pt           = model_info['power_transformer']
+    feats        = model_info['features']
+    seq_len      = model_info['sequence_length']
+    latent_dim   = model_info['latent_dim']
+    orig_min_max = model_info['original_min_max']
+
+    T = float(temperature_map.get(category, 1.0))           # temperature for latent sampling
+    num_seq = max(1, int(np.ceil(need / seq_len)))           # how many latent sequences to decode
+
+    # ── 1. Draw inter‑arrival times via MMPP ─────────────────────────────
     ia_times = generate_mmpp_interarrival_time(need, burst_level)
-    ia_iter = iter(ia_times)
+    ia_iter  = iter(ia_times)
 
+    jobs: list[dict] = []
+
+    # ── 2. Decode jobs in chunks of `seq_len` from the VAE ───────────────
     for _ in range(num_seq):
-        z = torch.randn(1, latent) * T  # Sample from a normal distribution
+        z = torch.randn(1, latent_dim) * T
         with torch.no_grad():
-            out = m.decode(z, seq_len).cpu().numpy().reshape(seq_len, len(feats))
-        inv = scaler.inverse_transform(out)
+            decoded = m.decode(z, seq_len).cpu().numpy().reshape(seq_len, len(feats))
+
+        # inverse‑scale
+        decoded = scaler.inverse_transform(decoded)
+
+        # inverse power‑transform (if present)
         if pt is not None:
-            temp_df = pd.DataFrame(inv, columns=feats)
+            df_dec = pd.DataFrame(decoded, columns=feats)
             pt_cols = list(pt.feature_names_in_)
-            common = [c for c in pt_cols if c in feats]
+            common  = [c for c in pt_cols if c in feats]
             if common:
-                # Create DataFrame in the original PT order
-                pt_input = pd.DataFrame(temp_df[common].values, columns=pt_cols)
-                pt_inv = pt.inverse_transform(pt_input)
-                temp_df[common] = pd.DataFrame(pt_inv, columns=common)
-            inv = temp_df.values
-        # clipping
-        for i,f in enumerate(feats):
-            mm = orig_mm.get(f)
+                df_dec[common] = pt.inverse_transform(df_dec[common])
+            decoded = df_dec.values
+
+        # clip to original min‑max
+        for i, f in enumerate(feats):
+            mm = orig_min_max.get(f)
             if mm:
-                inv[:,i] = np.clip(inv[:,i], mm['min'], mm['max'])
-        # build job dicts
-        for row in inv:
+                decoded[:, i] = np.clip(decoded[:, i], mm['min'], mm['max'])
+
+        # build individual job dicts
+        for row in decoded:
             job = {feats[i]: float(row[i]) for i in range(len(feats))}
+
+            # ── normalised & helper fields ────────────────────────────
             job['interarrival'] = next(ia_iter, 0.0)
-            job['category'] = category
-            if 'AllocatedProcessors' in job:
-                # round half-to-even by default; cast to int
-                job['AllocatedProcessors'] = int(round(job['AllocatedProcessors']))
+            job['category']     = category
+            job['length']       = job.get('RunTime', 0.0)
+            job['cpu_time']     = job.get('AverageCPUTimeUsed', 0.0)
+            job['ram']          = job.get('UsedMemory', 0.0)
+
+            # processors / PEs
+            alloc = int(round(job.get('AllocatedProcessors', 1)))
+            job['AllocatedProcessors'] = alloc
+            job['pes'] = alloc
+
+            # burst indicator for the consumer side
+            job['user_burst_level'] = burst_from_category(category) or burst_level
+
             jobs.append(job)
+
+    # trim to the exact number requested
     jobs = jobs[:need]
-    # ← NEW: assign each job a real UserID sampled from history for this category
-    if category in category_user_counts:
-        users, probs = category_user_counts[category]
-        logger.debug(f"Sampling user for category {category} from {len(users)} candidates")
-        for job in jobs:
-            job['user_id'] = np.random.choice(users, p=probs)
+
+    # ── 3. Attach user‑IDs sampled from historical distribution ──────────
+    users_probs = category_user_counts.get(category)
+    if users_probs:
+        users, probs = users_probs
+        for j in jobs:
+            j['user_id'] = int(np.random.choice(users, p=probs))
     else:
-        logger.warning(f"No usercounts for category {category}, leaving user_id blank")        
+        logger.warning(f"No user‑count distribution for category '{category}'; "
+                       "jobs will have no user_id assigned.")
+
     return jobs
 
 
@@ -543,24 +619,50 @@ def _interactive_setup():
         try:
             with open(TIME_CATEGORY_DIST_FILE, 'r') as f:
                 dist_data = json.load(f)
+
+            # Load top-level keys
             time_category_distribution = dist_data.get("category_distribution", {})
             granularity_minutes = dist_data.get("granularity_minutes", 10)
-            # ← NEW: load the real-user counts per category
-            raw_counts = dist_data.get("category_user_counts", {})
-            # build sampling arrays
-            for cat, u2c in raw_counts.items():
-                users = list(u2c.keys())
-                counts = np.array(list(u2c.values()), dtype=float)
-                probs = counts / counts.sum() if counts.sum()>0 else np.ones_like(counts)/len(counts)
-                category_user_counts[cat] = (users, probs)
-            logger.info(f"Loaded user‐count distributions for {len(category_user_counts)} categories: "
-            f"{list(category_user_counts.keys())}")
+
+            # Aggregate user counts from nested "user_counts" inside each time bucket
+            from collections import defaultdict, Counter
+            category_user_counter = defaultdict(Counter)
+
+            for day, time_buckets in time_category_distribution.items():
+                for time_slot, bucket in time_buckets.items():
+                    if isinstance(bucket, dict) and 'user_counts' in bucket:
+                        user_counts = bucket['user_counts']
+                        for category, user_map in user_counts.items():
+                            for user_id_str, count in user_map.items():
+                                try:
+                                    user_id = int(user_id_str)
+                                    category_user_counter[category][user_id] += count
+                                except ValueError:
+                                    logger.warning(f"Invalid user_id '{user_id_str}' for category '{category}' at {day} {time_slot}")
+
+            # Build probability distributions from raw count counters
+            category_user_counts.clear()
+            for cat, counter in category_user_counter.items():
+                try:
+                    users = np.array(list(counter.keys()), dtype=int)
+                    counts = np.array(list(counter.values()), dtype=float)
+                    probs = counts / counts.sum() if counts.sum() > 0 else np.ones_like(counts) / len(counts)
+                    category_user_counts[cat] = (users, probs)
+                except Exception as e:
+                    logger.warning(f"Skipping category '{cat}' due to user-count processing error: {e}")
+
+            logger.info(f"Loaded user-count distributions for {len(category_user_counts)} categories: "
+                        f"{list(category_user_counts.keys())}")
             logger.info(f"Loaded time-based category distribution (granularity: {granularity_minutes} min).")
+
         except Exception as e:
-            logger.error(f"Failed to load time-based category distribution: {e}. Time-based simulation will fall back to random categories.")
+            logger.error(f"Failed to load time-based category distribution: {e}. Falling back to random categories.")
             time_category_distribution = {}
     else:
-        logger.warning(f"Time-based category distribution file '{TIME_CATEGORY_DIST_FILE}' not found. Time-based simulation will fall back to random categories.")
+        logger.warning(f"Time-based category distribution file '{TIME_CATEGORY_DIST_FILE}' not found. "
+                    f"Time-based simulation will fall back to random categories.")
+
+
 
 
     # 2. VAE Model Training Setup
@@ -611,6 +713,7 @@ def _interactive_setup():
         sys.exit("No VAE models loaded. Exiting.")
 
     logger.info("Tuning temperatures for each VAE model (this may take a moment)...")
+    global temperature_map
     temperature_map = tune_temperatures(vae_models)
     logger.info(f"Tuned temperatures: {temperature_map}")
 
