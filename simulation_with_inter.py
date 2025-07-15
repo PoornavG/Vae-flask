@@ -129,35 +129,46 @@ def build_sampling_arrays(u2c: dict):
 
 # ─── MMPP GENERATOR ───────────────────────────────────────────────────────
 # (Keep this as is, it's a utility for generating inter-arrival times)
-def generate_mmpp_interarrival_time(num_jobs_to_generate, current_burst_level):
+def generate_mmpp_interarrival_time(num_jobs_to_generate, mmpp_params):
     """
     Simulates inter-arrival times using a Markov Modulated Poisson Process (MMPP).
+    
+    Parameters:
+        num_jobs_to_generate (int): Number of inter-arrival times to generate.
+        mmpp_params (dict): Contains 'P_TRANSITION' matrix and 'POISSON_RATES' dictionary.
+
+    Returns:
+        list[float]: A list of inter-arrival times.
     """
     inter_arrival_times = []
-    # Map burst level string to its index in P_TRANSITION
-    current_state_idx = BURST_LEVEL_MAP.get(current_burst_level, 0) # Default to 'Low' (index 0)
+
+    P_TRANSITION = mmpp_params["P_TRANSITION"]
+    POISSON_RATES = mmpp_params["POISSON_RATES"]
+
+    # Start from state 0 (e.g., 'Low')
+    current_state_idx = 0
+
+    state_name_map = ['Low', 'Mid', 'High']  # Maps index → string key
 
     for _ in range(num_jobs_to_generate):
-        # Get the Poisson rate for the current state
-        rate = POISSON_RATES.get(list(BURST_LEVEL_MAP.keys())[current_state_idx])
+        state_name = state_name_map[current_state_idx]
+        rate = POISSON_RATES.get(state_name, 1.0)  # Fallback if rate missing
 
-        # Generate inter-arrival time from exponential distribution (Poisson process)
-        # Handle cases where rate might be zero or negative to prevent errors
         if rate <= 0:
-            inter_arrival_time = 0.0 # Or some sensible default if no arrivals expected
+            inter_arrival_time = 0.0
         else:
             inter_arrival_time = np.random.exponential(1 / rate)
-        
+
         inter_arrival_times.append(inter_arrival_time)
 
-        # Transition to the next state based on transition probabilities
-        next_state_idx = np.random.choice(
-            len(P_TRANSITION), 
-            p=P_TRANSITION[current_state_idx]
-        )
-        current_state_idx = next_state_idx
-    
+        # Transition to the next state based on P_TRANSITION
+        if current_state_idx < len(P_TRANSITION):
+            current_state_idx = np.random.choice(len(P_TRANSITION), p=P_TRANSITION[current_state_idx])
+        else:
+            current_state_idx = 0  # fallback in case of error
+
     return inter_arrival_times
+
 
 # ─── HELPER: map category suffix to burst string ──────────────────────────
 def burst_from_category(category: str) -> str:
@@ -333,7 +344,28 @@ def sample_valid_jobs_for_user(
     num_seq = max(1, int(np.ceil(need / seq_len)))           # how many latent sequences to decode
 
     # ── 1. Draw inter‑arrival times via MMPP ─────────────────────────────
-    ia_times = generate_mmpp_interarrival_time(need, burst_level)
+    # ── 0.5 Load MMPP parameters for this burst level ───────────────────────
+    burst_index = BURST_LEVEL_MAP.get(burst_level, 1)  # fallback = Mid
+    mmpp_path = f'mmpp_config_Burst_{burst_index}.json'
+
+    if not hasattr(sample_valid_jobs_for_user, "_mmpp_cache"):
+        sample_valid_jobs_for_user._mmpp_cache = {}
+
+    if mmpp_path not in sample_valid_jobs_for_user._mmpp_cache:
+        try:
+            with open(mmpp_path, 'r') as f:
+                mmpp_config = json.load(f)
+            sample_valid_jobs_for_user._mmpp_cache[mmpp_path] = mmpp_config
+        except FileNotFoundError:
+            logger.error(f"MMPP config '{mmpp_path}' not found. Using default Poisson fallback.")
+            sample_valid_jobs_for_user._mmpp_cache[mmpp_path] = {
+                "P_TRANSITION": [[1.0]],
+                "POISSON_RATES": {"Low": 1.0}
+            }
+
+    mmpp_params = sample_valid_jobs_for_user._mmpp_cache[mmpp_path]
+    ia_times = generate_mmpp_interarrival_time(need, mmpp_params)
+
     ia_iter  = iter(ia_times)
 
     jobs: list[dict] = []

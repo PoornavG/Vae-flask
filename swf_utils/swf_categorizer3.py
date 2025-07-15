@@ -426,15 +426,27 @@ def main():
     user_profiles_df.to_csv("user_profiles.csv", index=False)
     logger.info("User profiles exported to 'user_profiles.csv'")
     
-    # 3. Compute MMPP parameters and save them to a JSON file
-    transition_matrix, poisson_rates = compute_mmpp_parameters(clean_data)
-    mmpp_params = {
-        'P_TRANSITION': transition_matrix,
-        'POISSON_RATES': poisson_rates
-    }
-    with open('mmpp_config.json', 'w') as f:
-        json.dump(mmpp_params, f, indent=4)
-    logger.info("MMPP parameters exported to 'mmpp_config.json'")
+
+    # 3. Compute per-burst-level MMPP parameters
+    for burst_label in ['Low', 'Mid', 'High']:
+        burst_df = clean_data[clean_data['UserID'].isin(
+            user_profiles_df[user_profiles_df['BurstLevel'] == burst_label]['UserID']
+        )]
+
+        if burst_df.empty:
+            logger.warning(f"No data found for Burst level '{burst_label}'. Skipping MMPP config.")
+            continue
+
+        transition_matrix, poisson_rates = compute_mmpp_parameters(burst_df)
+        mmpp_params = {
+            'P_TRANSITION': transition_matrix,
+            'POISSON_RATES': poisson_rates
+        }
+        output_path = f'mmpp_config_Burst_{BURST_LEVEL_MAP[burst_label]}.json'
+        with open(output_path, 'w') as f:
+            json.dump(mmpp_params, f, indent=4)
+        logger.info(f"MMPP parameters for Burst level '{burst_label}' exported to '{output_path}'")
+
 
     # 4. Export categorized subsets for VAE training
     export_subsets_to_excel(clean_data)
