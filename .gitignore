@@ -9,6 +9,7 @@ venv/
 # Ignore all folders except swf_utils
 /*/
 !/swf_utils/
+!/Synthesizer/
 
 # Optional: if swf_utils contains nested folders you want to include
 !/swf_utils/**
