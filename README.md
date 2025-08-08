@@ -43,7 +43,7 @@ The project is broken down into a few key stages that work together:
 
     ```bash
 
-    git clone <repository-url>
+    git clone [<repository-url>](https://github.com/PoornavG/Vae-flask.git)
 
     cd <repository-name>
 
