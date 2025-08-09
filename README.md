@@ -88,35 +88,35 @@ The project is broken down into a few key stages that work together:
 
 4. Clone CloudSim 5.0
 
-If you haven't already:
-```bash
-git clone https://github.com/Cloudslab/cloudsim.git cloudsim-master
-```
+    If you haven't already:
+    ```bash
+    git clone https://github.com/Cloudslab/cloudsim.git cloudsim-master
+    ```
 
 5. Place Java Files in Correct Package Path
 
-Copy the following files:
-
-- `CloudSimOptimizationRunner.java`
-- `CloudSimSimulationSuite.java`
-- `TimeRangeJobLoader.java`
-
-**To this path:**
-cloudsim-master/modules/cloudsim-examples/src/main/java/org/cloudbus/cloudsim/examples/
-
-This is required because these classes belong to the `org.cloudbus.cloudsim.examples` Java package.
+    Copy the following files:
+    
+    - `CloudSimOptimizationRunner.java`
+    - `CloudSimSimulationSuite.java`
+    - `TimeRangeJobLoader.java`
+    
+    **To this path:**
+    cloudsim-master/modules/cloudsim-examples/src/main/java/org/cloudbus/cloudsim/examples/
+    
+    This is required because these classes belong to the `org.cloudbus.cloudsim.examples` Java package.
 
 
 6. Place Python Scripts in Module Root
 
-Copy:
-
-- `optimize_cloudsim.py`
-- `visualize_optimization.py`
-
-**To:**
-cloudsim-master/modules/cloudsim-examples/
-These scripts run from the CloudSim examples root and interact with the Java simulation via CLI and CSV files.
+    Copy:
+    
+    - `optimize_cloudsim.py`
+    - `visualize_optimization.py`
+    
+    **To:**
+    cloudsim-master/modules/cloudsim-examples/
+    These scripts run from the CloudSim examples root and interact with the Java simulation via CLI and CSV files.
 
 
 7.  *Initial Data Processing and VAE Training*
@@ -159,19 +159,19 @@ Once everything is set up, you can run the different parts of the project.
 
 2.  *Run a Single CloudSim Simulation*
 
-Navigate to the CloudSim examples module and compile:
-
-```bash
-cd cloudsim-master/modules/cloudsim-examples
-mvn clean compile
-```
-
-To run a simulation manually:
-
-```bash
-mvn exec:java -Dexec.mainClass="org.cloudbus.cloudsim.examples.CloudSimOptimizationRunner"
-```
-
+    Navigate to the CloudSim examples module and compile:
+    
+    ```bash
+    cd cloudsim-master/modules/cloudsim-examples
+    mvn clean compile
+    ```
+    
+    To run a simulation manually:
+    
+    ```bash
+    mvn exec:java -Dexec.mainClass="org.cloudbus.cloudsim.examples.CloudSimOptimizationRunner"
+    ```
+    
 
 
 3.  *Find the Best VM Configuration*
