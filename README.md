@@ -45,7 +45,7 @@ The project is broken down into a few key stages that work together:
 
     git clone https://github.com/PoornavG/Vae-flask.git
 
-    cd <repository-name>
+    cd Vae-flask
 
     ```
 
