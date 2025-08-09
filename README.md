@@ -43,7 +43,7 @@ The project is broken down into a few key stages that work together:
 
     ```bash
 
-    git clone [<repository-url>](https://github.com/PoornavG/Vae-flask.git)
+    git clone https://github.com/PoornavG/Vae-flask.git
 
     cd <repository-name>
 
@@ -86,17 +86,37 @@ The project is broken down into a few key stages that work together:
     ```
 
 
+4. Clone CloudSim 5.0
 
-4.  *Set up CloudSim*
+If you haven't already:
+```bash
+git clone https://github.com/Cloudslab/cloudsim.git cloudsim-master
+```
 
-    The project includes the necessary CloudSim files. You'll need to compile them using Maven. Navigate to the CloudSim directory and run:
+5. Place Java Files in Correct Package Path
 
-    ```bash
+Copy the following files:
 
-    cd CloudSim
+- `CloudSimOptimizationRunner.java`
+- `CloudSimSimulationSuite.java`
+- `TimeRangeJobLoader.java`
 
-    mvn clean compile
-    ```
+**To this path:**
+cloudsim-master/modules/cloudsim-examples/src/main/java/org/cloudbus/cloudsim/examples/
+
+This is required because these classes belong to the `org.cloudbus.cloudsim.examples` Java package.
+
+
+6. Place Python Scripts in Module Root
+
+Copy:
+
+- `optimize_cloudsim.py`
+- `visualize_optimization.py`
+
+**To:**
+cloudsim-master/modules/cloudsim-examples/
+These scripts run from the CloudSim examples root and interact with the Java simulation via CLI and CSV files.
 
 
 5.  *Initial Data Processing and VAE Training*
@@ -139,17 +159,18 @@ Once everything is set up, you can run the different parts of the project.
 
 2.  *Run a Single CloudSim Simulation*
 
-    Open a *new terminal window* and navigate to the CloudSim directory. You can run a single simulation with a default VM configuration using the following command:
+Navigate to the CloudSim examples module and compile:
 
-    ```bash
+```bash
+cd cloudsim-master/modules/cloudsim-examples
+mvn clean compile
+```
 
-    cd CloudSim
+To run a simulation manually:
 
-    mvn exec:java -Dexec.mainClass="org.cloudbus.cloudsim.examples.CloudSimSimulationSuite"
-
-    ```
-
-    This will run the simulation and print out detailed results, including job completion times, waiting times, and resource utilization.
+```bash
+mvn exec:java -Dexec.mainClass="org.cloudbus.cloudsim.examples.CloudSimOptimizationRunner"
+```
 
 
 
