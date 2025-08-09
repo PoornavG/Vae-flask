@@ -119,7 +119,7 @@ cloudsim-master/modules/cloudsim-examples/
 These scripts run from the CloudSim examples root and interact with the Java simulation via CLI and CSV files.
 
 
-5.  *Initial Data Processing and VAE Training*
+7.  *Initial Data Processing and VAE Training*
 
     Before you can run the simulation, you need to process your workload data and train the VAE model. The simulation_with_inter.py script has an interactive setup that will guide you through this.
 
